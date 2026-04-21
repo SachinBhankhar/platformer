@@ -9,7 +9,7 @@ BUILD_DIR="build/macos"
 DIST_DIR="dist"
 
 # Source files to include (all .lua files + any assets if added later)
-SOURCES=(camera.lua conf.lua enemy.lua levels.lua main.lua network.lua particles.lua player.lua world.lua)
+SOURCES=(camera.lua conf.lua enemy.lua levels.lua main.lua netmsg.lua network.lua particles.lua player.lua world.lua)
 
 echo "==> Cleaning build directory"
 rm -rf "$BUILD_DIR"

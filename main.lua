@@ -43,8 +43,16 @@ end
 
 local function spawnEnemies(levelData)
     enemies = {}
-    for _, sp in ipairs(levelData.enemies or {}) do
-        table.insert(enemies, Enemy.new(world, sp[1], sp[2]))
+    for idx, sp in ipairs(levelData.enemies or {}) do
+        local e = Enemy.new(world, sp[1], sp[2])
+        e.id = idx  -- stable id so the client can match after host removals
+        table.insert(enemies, e)
+    end
+end
+
+local function findEnemy(id)
+    for _, e in ipairs(enemies) do
+        if e.id == id then return e end
     end
 end
 
@@ -138,23 +146,51 @@ local function applyNetworkState(data)
             players[id] = Player.new(world, id)
         end
         local p = players[id]
-        if id ~= localPlayerId then
-            -- Only sync remote players' positions; local player is predicted locally
+        local wasDead = p.dead
+        p.lives = lives; p.dead = dead
+        p.eliminated = elim; p.won = won; p.coins = coins
+        if id == localPlayerId then
+            -- Client-side prediction with server reconciliation: trust local
+            -- prediction while it stays close to the host, snap when it drifts.
+            -- Always snap on death/respawn transitions (prediction can't know).
+            if dead and not wasDead then
+                p.x = x; p.y = y; p.vx = vx; p.vy = vy
+                p.respawnTimer = 1.5
+            elseif wasDead and not dead then
+                p.x = x; p.y = y; p.vx = 0; p.vy = 0
+                p.invTimer = 2.5
+            else
+                local dx, dy = p.x - x, p.y - y
+                if dx*dx + dy*dy > 24*24 then
+                    p.x = x; p.y = y; p.vx = vx; p.vy = vy
+                end
+            end
+        else
+            -- Remote players: full sync, host is authoritative.
             p.x = x; p.y = y; p.vx = vx; p.vy = vy
             p.facing = facing; p.onGround = onGround; p.walkFrame = walkFrame
         end
-        p.lives = lives; p.eliminated = elim; p.dead = dead; p.won = won
-        p.coins = coins
     end
     local ecount = data[i]; i = i + 1
-    -- sync enemy positions
-    for j = 1, math.min(ecount, #enemies) do
+    -- Sync enemies by stable id. The host removes enemies after their death
+    -- animation, so any local enemy whose id isn't in the snapshot is gone.
+    local seen = {}
+    for _ = 1, ecount do
+        local eid  = data[i]; i = i + 1
         local ex   = data[i]; i = i + 1
         local ey   = data[i]; i = i + 1
         local dead = data[i]==1; i = i + 1
         local dt   = data[i]; i = i + 1
-        enemies[j].x = ex; enemies[j].y = ey
-        enemies[j].dead = dead; enemies[j].deadTimer = dt
+        seen[eid] = true
+        local e = findEnemy(eid)
+        if e then
+            e.x = ex; e.y = ey
+            e.dead = dead; e.deadTimer = dt
+        end
+    end
+    local k = 1
+    while k <= #enemies do
+        if seen[enemies[k].id] then k = k + 1 else table.remove(enemies, k) end
     end
 end
 
@@ -223,7 +259,10 @@ function love.update(dt)
                         p.input.right = ev.right
                         p.input.jump  = ev.jump
                         p.input.run   = ev.run
-                        p.input.jumpPressed = ev.jumpPressed
+                        -- Latch jumpPressed: multiple INPUT packets can arrive
+                        -- between sim ticks, and we must not let a later
+                        -- `false` packet erase a pending jump edge.
+                        if ev.jumpPressed then p.input.jumpPressed = true end
                     end
                 end
             end
@@ -232,6 +271,10 @@ function love.update(dt)
             local lp = players[localPlayerId]
             if lp then lp:readLocalKeys() end
             local inp = lp and lp.input or {left=false,right=false,jump=false,run=false,jumpPressed=false}
+
+            -- Snapshot coins before applying host state
+            local prevCoins = lp and lp.coins or 0
+
             local evts = net:clientUpdate(dt, inp)
             for _, ev in ipairs(evts) do
                 if ev.type == "state" then
@@ -245,17 +288,21 @@ function love.update(dt)
                     state = "menu"
                 end
             end
-            -- Client: only update the local player locally (prediction)
-            if lp and not lp.eliminated then
-                local prevCoins = lp.coins
-                lp:update(dt)
-                if lp.coins > prevCoins then
-                    particles:spawn(lp.x + lp.w/2, lp.y, {1,0.9,0}, 8, 140)
-                end
+
+            -- Spawn coin particles when host confirms a collection
+            if lp and lp.coins > prevCoins then
+                particles:spawn(lp.x + lp.w/2, lp.y, {1,0.9,0}, 8, 140)
+            end
+
+            -- Client-side prediction: simulate local player's movement for
+            -- instant input response. applyNetworkState reconciles against
+            -- the host and snaps if drift exceeds threshold.
+            if lp and not lp.eliminated and not lp.dead then
+                lp:updateMovement(dt)
             end
             particles:update(dt)
             local sw, sh = love.graphics.getDimensions()
-            camera:follow(lp and {lp} or activePlayers(), sw, sh)
+            if lp then camera:follow({lp}, sw, sh) end
             return
         end
     else
@@ -289,8 +336,9 @@ function love.update(dt)
     for _, attacker in ipairs(aList) do
         for _, victim in ipairs(aList) do
             if attacker ~= victim then
+                local wasEliminated = victim.eliminated
                 victim:checkStompedBy(attacker)
-                if victim.eliminated then
+                if victim.eliminated and not wasEliminated then
                     particles:spawn(victim.x + victim.w/2, victim.y, {1,0.3,0.3}, 12, 160)
                 end
             end
@@ -312,8 +360,17 @@ function love.update(dt)
     particles:update(dt)
 
     local sw, sh = love.graphics.getDimensions()
-    local followList = (net and players[localPlayerId]) and {players[localPlayerId]} or aList
-    camera:follow(followList, sw, sh)
+    local followList
+    if net then
+        -- Multiplayer: always follow only the local player
+        local lp = players[localPlayerId]
+        followList = lp and {lp} or {}
+    else
+        followList = aList
+    end
+    if #followList > 0 then
+        camera:follow(followList, sw, sh)
+    end
 
     -- State transitions
     if allPlayersWon() then

@@ -51,6 +51,7 @@ function Player.new(world, id)
     self.startY = self.y
     self.walkTimer = 0
     self.walkFrame = 0
+    self.invTimer  = 0
     -- input state (filled by local keyboard or network)
     self.input = {left=false, right=false, jump=false, run=false, jumpPressed=false}
     self._prevJump = false
@@ -68,6 +69,84 @@ function Player:readLocalKeys()
     self._prevJump = inp.jump
 end
 
+-- Movement-only update used by the client for local prediction.
+-- No coin collection or goal detection — host is authoritative for those.
+function Player:updateMovement(dt)
+    if self.eliminated then return end
+
+    if self.dead then
+        self.respawnTimer = self.respawnTimer - dt
+        self.vy = self.vy + GRAVITY_DOWN * dt
+        self.y  = self.y + self.vy * dt
+        if self.respawnTimer <= 0 then
+            self:respawn()
+        end
+        return
+    end
+
+    if self.invTimer > 0 then self.invTimer = self.invTimer - dt end
+
+    local inp = self.input
+    local topSpeed = inp.run and RUN_SPEED or WALK_SPEED
+    local moving = false
+    if inp.left then
+        self.vx = self.vx - ACCEL * dt
+        if self.vx < -topSpeed then self.vx = -topSpeed end
+        self.facing = -1
+        moving = true
+    elseif inp.right then
+        self.vx = self.vx + ACCEL * dt
+        if self.vx > topSpeed then self.vx = topSpeed end
+        self.facing = 1
+        moving = true
+    end
+    if not moving then
+        local sign = self.vx > 0 and 1 or -1
+        self.vx = self.vx - sign * math.min(FRICTION * dt, math.abs(self.vx))
+    end
+
+    local grav = (self.vy < 0) and GRAVITY_UP or GRAVITY_DOWN
+    self.vy = self.vy + grav * dt
+    if not inp.jump and self.vy < -150 then
+        self.vy = self.vy + GRAVITY_UP * 2 * dt
+    end
+
+    self.jumpBuffer  = math.max(0, self.jumpBuffer  - 1)
+    self.coyoteTimer = math.max(0, self.coyoteTimer - 1)
+    if inp.jumpPressed and self.coyoteTimer > 0 then
+        self.vy = JUMP_FORCE; self.coyoteTimer = 0; self.jumpBuffer = 0
+    elseif inp.jumpPressed then
+        self.jumpBuffer = JUMP_BUFFER
+    end
+    if self.jumpBuffer > 0 and self.coyoteTimer > 0 then
+        self.vy = JUMP_FORCE; self.coyoteTimer = 0; self.jumpBuffer = 0
+    end
+    inp.jumpPressed = false  -- consume the edge; latch fills it again on next press
+
+    local nx, ny, nvx, nvy, ground, ceiling, spike =
+        self.world:move(self.x, self.y, self.w, self.h, self.vx * dt, self.vy * dt)
+    self.x = nx; self.y = ny
+    self.vx = nvx / dt; self.vy = nvy / dt
+    if ceiling then self.vy = math.max(0, self.vy) end
+    if ground then self.vy = 0; self.coyoteTimer = COYOTE_FRAMES end
+    self.onGround = ground
+
+    -- Do NOT call die() here — host owns `lives` and `dead`. If the client
+    -- hits a spike or falls, the host will see it too and broadcast dead=true;
+    -- applyNetworkState will then flip our state and snap position.
+
+    if moving and self.onGround then
+        self.walkTimer = self.walkTimer + dt
+        if self.walkTimer > 0.12 then
+            self.walkTimer = 0
+            self.walkFrame = (self.walkFrame + 1) % 2
+        end
+    else
+        self.walkFrame = 0
+        self.walkTimer = 0
+    end
+end
+
 function Player:update(dt)
     if self.eliminated then return end
 
@@ -81,6 +160,8 @@ function Player:update(dt)
         end
         return
     end
+
+    if self.invTimer > 0 then self.invTimer = self.invTimer - dt end
 
     local inp = self.input
 
@@ -132,6 +213,7 @@ function Player:update(dt)
         self.coyoteTimer = 0
         self.jumpBuffer  = 0
     end
+    inp.jumpPressed = false  -- consume the edge; latch/readLocalKeys refills it
 
     -- Move + collide
     local nx, ny, nvx, nvy, ground, ceiling, spike =
@@ -178,6 +260,7 @@ function Player:checkStompedBy(attacker)
     if attacker == self then return false end
     if attacker.eliminated or attacker.dead then return false end
     if self.eliminated or self.dead then return false end
+    if self.invTimer > 0 then return false end
 
     -- AABB overlap
     local overlap = attacker.x < self.x + self.w and
@@ -203,6 +286,7 @@ end
 
 function Player:die(pvpKill)
     if self.dead or self.eliminated then return end
+    if self.invTimer > 0 then return end
     self.lives = self.lives - 1
     self.dead  = true
     self.respawnTimer = 1.5
@@ -215,12 +299,13 @@ end
 
 function Player:respawn()
     if self.eliminated then return end
-    self.x   = self.startX
-    self.y   = self.startY
-    self.vx  = 0
-    self.vy  = 0
-    self.dead = false
-    self.won  = false
+    self.x        = self.startX
+    self.y        = self.startY
+    self.vx       = 0
+    self.vy       = 0
+    self.dead     = false
+    self.won      = false
+    self.invTimer = 2.5
 end
 
 function Player:resetForLevel(world)
@@ -239,6 +324,7 @@ function Player:resetForLevel(world)
     self.jumpBuffer  = 0
     self.walkFrame   = 0
     self.walkTimer   = 0
+    self.invTimer    = 0
 end
 
 function Player:draw(camX, camY)
@@ -254,23 +340,29 @@ function Player:draw(camX, camY)
         return
     end
 
+    -- Spawn-protection flash: visible half the time at reduced alpha
+    local alpha = 1
+    if self.invTimer > 0 then
+        alpha = (math.floor(self.invTimer * 10) % 2 == 0) and 0.3 or 0.85
+    end
+
     -- Body
-    love.graphics.setColor(c[1], c[2], c[3])
+    love.graphics.setColor(c[1], c[2], c[3], alpha)
     love.graphics.rectangle("fill", px, py + 10, self.w, self.h - 10)
 
     -- Hat (darker shade)
-    love.graphics.setColor(c[1]*0.6, c[2]*0.6, c[3]*0.6)
+    love.graphics.setColor(c[1]*0.6, c[2]*0.6, c[3]*0.6, alpha)
     love.graphics.rectangle("fill", px - 2, py, self.w + 4, 14)
 
     -- Player number badge
-    love.graphics.setColor(1, 1, 1)
+    love.graphics.setColor(1, 1, 1, alpha)
     love.graphics.print(self.id, px + self.w/2 - 3, py + 2)
 
     -- Eyes
     local eyeX = self.facing == 1 and (px + self.w - 7) or (px + 4)
-    love.graphics.setColor(1, 1, 1)
+    love.graphics.setColor(1, 1, 1, alpha)
     love.graphics.rectangle("fill", eyeX, py + 3, 5, 5)
-    love.graphics.setColor(0, 0, 0)
+    love.graphics.setColor(0, 0, 0, alpha)
     love.graphics.rectangle("fill", eyeX + (self.facing == 1 and 2 or 0), py + 4, 3, 3)
 
     -- Legs

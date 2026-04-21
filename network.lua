@@ -6,7 +6,7 @@ Network.__index = Network
 local enet = require "enet"
 local netmsg = require "netmsg"
 local PORT = 6789
-local TICK_RATE = 20  -- state broadcasts per second from host
+local TICK_RATE = 60  -- state broadcasts per second from host
 local DISCOVERY_PORT = 6790
 
 local pack       = netmsg.pack
@@ -78,9 +78,16 @@ function Network:hostUpdate(dt, players, world, enemies, currentLevel)
         end
     end
 
-    -- Handle enet events
-    local ev = self.host:service(0)
-    while ev do
+    -- Handle enet events. Wrap in pcall — service() can raise on an ungraceful
+    -- peer disconnect or malformed packet, and we don't want that to crash the
+    -- host mid-game (observed on level transitions).
+    while true do
+        local ok, ev = pcall(function() return self.host:service(0) end)
+        if not ok then
+            print("[NET] service error: " .. tostring(ev))
+            break
+        end
+        if not ev then break end
         if ev.type == "connect" then
             local id = self.nextId
             self.nextId = self.nextId + 1
@@ -97,13 +104,12 @@ function Network:hostUpdate(dt, players, world, enemies, currentLevel)
                 print("[NET] Player " .. id .. " left")
             end
         elseif ev.type == "receive" then
-            local d = unpack_msg(ev.data)
-            if d[1] == "INPUT" then
+            local ok2, d = pcall(unpack_msg, ev.data)
+            if ok2 and d[1] == "INPUT" then
                 local id = self.peers[ev.peer]
                 events[#events+1] = {type="input", id=id, left=d[2]==1, right=d[3]==1, jump=d[4]==1, run=d[5]==1, jumpPressed=d[6]==1}
             end
         end
-        ev = self.host:service(0)
     end
 
     -- Broadcast state at tick rate
@@ -138,6 +144,7 @@ function Network:buildStateMsg(players, enemies, currentLevel)
     end
     parts[#parts+1] = #enemies
     for _, e in ipairs(enemies) do
+        parts[#parts+1] = e.id or 0
         parts[#parts+1] = math.floor(e.x)
         parts[#parts+1] = math.floor(e.y)
         parts[#parts+1] = e.dead and 1 or 0
@@ -152,31 +159,40 @@ end
 function Network:clientUpdate(dt, inputs)
     local events = {}
 
-    -- Send inputs every frame
+    -- Send inputs every frame. jumpPressed is edge-triggered for one frame,
+    -- so send reliably on that edge — otherwise a single dropped UDP packet
+    -- eats the jump and the client's prediction diverges from the host.
     if self.myId then
         local msg = pack({"INPUT", inputs.left, inputs.right, inputs.jump, inputs.run, inputs.jumpPressed})
-        self.server:send(msg, 0, "unreliable")
+        local chan = inputs.jumpPressed and "reliable" or "unreliable"
+        self.server:send(msg, 0, chan)
     end
 
-    local ev = self.host:service(0)
-    while ev do
+    while true do
+        local ok, ev = pcall(function() return self.host:service(0) end)
+        if not ok then
+            print("[NET] service error: " .. tostring(ev))
+            break
+        end
+        if not ev then break end
         if ev.type == "receive" then
-            local d = unpack_msg(ev.data)
-            if d[1] == "JOIN" then
-                self.myId = d[2]
-                events[#events+1] = {type="join", id=d[2], level=d[3]}
-                print("[NET] Assigned player ID " .. d[2])
-            elseif d[1] == "STATE" then
-                events[#events+1] = {type="state", data=d}
-            elseif d[1] == "LEVEL" then
-                events[#events+1] = {type="level", num=d[2]}
-            elseif d[1] == "COIN" then
-                events[#events+1] = {type="coin", tx=d[2], ty=d[3]}
+            local ok2, d = pcall(unpack_msg, ev.data)
+            if ok2 then
+                if d[1] == "JOIN" then
+                    self.myId = d[2]
+                    events[#events+1] = {type="join", id=d[2], level=d[3]}
+                    print("[NET] Assigned player ID " .. d[2])
+                elseif d[1] == "STATE" then
+                    events[#events+1] = {type="state", data=d}
+                elseif d[1] == "LEVEL" then
+                    events[#events+1] = {type="level", num=d[2]}
+                elseif d[1] == "COIN" then
+                    events[#events+1] = {type="coin", tx=d[2], ty=d[3]}
+                end
             end
         elseif ev.type == "disconnect" then
             events[#events+1] = {type="disconnect"}
         end
-        ev = self.host:service(0)
     end
 
     return events

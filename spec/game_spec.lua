@@ -224,6 +224,7 @@ describe("Network buildStateMsg", function()
         end
         parts[#parts+1] = #enemies
         for _, e in ipairs(enemies) do
+            parts[#parts+1] = e.id or 0
             parts[#parts+1] = math.floor(e.x)
             parts[#parts+1] = math.floor(e.y)
             parts[#parts+1] = e.dead and 1 or 0
@@ -278,14 +279,16 @@ describe("Network buildStateMsg", function()
     end)
 
     it("encodes enemies correctly", function()
-        local enemy = {x=300, y=64, dead=false, deadTimer=0}
+        local enemy = {id=1, x=300, y=64, dead=false, deadTimer=0}
         local msg   = buildStateMsg({}, {enemy}, 1)
         local t     = netmsg.unpack(msg)
-        -- header STATE+level+0players = indices 1..3, then enemy count at 4
+        -- header STATE+level+0players = indices 1..3, then enemy count at 4,
+        -- then per-enemy: id x y dead deadTimer
         assert.are.equal(t[4], 1)    -- enemy count
-        assert.are.equal(t[5], 300)  -- enemy x
-        assert.are.equal(t[6], 64)   -- enemy y
-        assert.are.equal(t[7], 0)    -- dead=false → 0
+        assert.are.equal(t[5], 1)    -- enemy id
+        assert.are.equal(t[6], 300)  -- enemy x
+        assert.are.equal(t[7], 64)   -- enemy y
+        assert.are.equal(t[8], 0)    -- dead=false → 0
     end)
 
     it("enemies table must not be a number (regression: lobby bug)", function()
@@ -347,6 +350,227 @@ describe("Multiplayer coin sync", function()
 
         -- Now client matches host
         assert.are.equal(client_world:getTile(2, 1), World.T_EMPTY)
+    end)
+
+end)
+
+-- ── Multiplayer: enemy id-based sync (regression) ────────────────────────────
+
+describe("Client enemy sync by stable id", function()
+
+    -- Mirrors main.lua applyNetworkState's enemy loop: match by id and drop
+    -- any local enemy whose id isn't in the host's snapshot. Regression: the
+    -- old code matched positionally by index, so when the host removed a dead
+    -- enemy the remaining host enemies shifted and the client froze the extras.
+    local function syncEnemies(clientEnemies, snapshot)
+        local seen = {}
+        for _, s in ipairs(snapshot) do
+            seen[s.id] = true
+            for _, e in ipairs(clientEnemies) do
+                if e.id == s.id then
+                    e.x = s.x; e.y = s.y; e.dead = s.dead
+                end
+            end
+        end
+        local k = 1
+        while k <= #clientEnemies do
+            if seen[clientEnemies[k].id] then k = k + 1
+            else table.remove(clientEnemies, k) end
+        end
+    end
+
+    it("removes local enemies whose id is missing from host snapshot", function()
+        local client = {
+            {id=1, x=10, y=10, dead=false},
+            {id=2, x=20, y=20, dead=false},
+            {id=3, x=30, y=30, dead=false},
+        }
+        -- Host killed enemy 2
+        syncEnemies(client, {
+            {id=1, x=11, y=10, dead=false},
+            {id=3, x=31, y=30, dead=false},
+        })
+        assert.are.equal(#client, 2)
+        assert.are.equal(client[1].id, 1)
+        assert.are.equal(client[2].id, 3)
+        assert.are.equal(client[2].x, 31)  -- host's enemy 3 applied to client's enemy 3
+    end)
+
+    it("does not mis-apply position after host removes an earlier enemy", function()
+        -- Previously: host enemy[2] (id=3) would be applied to client's enemy[2] (id=2 — now dead).
+        local client = {
+            {id=1, x=0, y=0, dead=false},
+            {id=2, x=0, y=0, dead=false},
+            {id=3, x=0, y=0, dead=false},
+        }
+        syncEnemies(client, {
+            {id=1, x=100, y=0, dead=false},
+            {id=3, x=300, y=0, dead=false},
+        })
+        -- Enemy id 3 must still land at x=300, not be lost or mis-targeted.
+        local byId = {}
+        for _, e in ipairs(client) do byId[e.id] = e end
+        assert.is_nil(byId[2])
+        assert.are.equal(byId[1].x, 100)
+        assert.are.equal(byId[3].x, 300)
+    end)
+
+end)
+
+-- ── Multiplayer: host jumpPressed latch (regression) ─────────────────────────
+
+describe("Host jumpPressed latch", function()
+
+    -- Regression: the host used to do `p.input.jumpPressed = ev.jumpPressed`
+    -- for every INPUT event. If two packets arrived in the same host frame
+    -- — {jumpPressed=true} then {jumpPressed=false} — the second erased the
+    -- first and the host never jumped, while the client's prediction did.
+    -- The fix: only promote false→true, never true→false. The sim tick consumes
+    -- the edge by clearing it after use.
+    local function applyInput(p_input, ev)
+        p_input.left  = ev.left
+        p_input.right = ev.right
+        p_input.jump  = ev.jump
+        p_input.run   = ev.run
+        if ev.jumpPressed then p_input.jumpPressed = true end
+    end
+
+    it("preserves a jumpPressed edge across multiple INPUT packets", function()
+        local inp = {left=false,right=false,jump=false,run=false,jumpPressed=false}
+        applyInput(inp, {jump=true,  jumpPressed=true})
+        applyInput(inp, {jump=true,  jumpPressed=false})  -- later packet same frame
+        applyInput(inp, {jump=false, jumpPressed=false})
+        assert.is_true(inp.jumpPressed)
+    end)
+
+    it("lets the sim tick consume the edge", function()
+        local inp = {left=false,right=false,jump=true,run=false,jumpPressed=true}
+        -- simulate Player:update consuming it
+        inp.jumpPressed = false
+        -- next frame, more INPUT packets with jumpPressed=false must not re-trigger
+        applyInput(inp, {jump=true, jumpPressed=false})
+        assert.is_false(inp.jumpPressed)
+    end)
+
+    it("re-latches on a new edge after consumption", function()
+        local inp = {left=false,right=false,jump=false,run=false,jumpPressed=false}
+        applyInput(inp, {jump=true, jumpPressed=true})
+        inp.jumpPressed = false  -- consumed by sim tick
+        applyInput(inp, {jump=false, jumpPressed=false})  -- key released
+        applyInput(inp, {jump=true,  jumpPressed=true})   -- pressed again
+        assert.is_true(inp.jumpPressed)
+    end)
+
+end)
+
+-- ── Multiplayer: local player lives/dead sync (regression) ───────────────────
+
+describe("Client applyNetworkState for local player", function()
+
+    -- Minimal reimplementation of the applyNetworkState sync logic for the
+    -- LOCAL player, matching main.lua. The bug: prior to the fix, `lives` and
+    -- `dead` were only synced for remote players, so when an enemy killed the
+    -- client-controlled player on the host, the client never saw it die —
+    -- lives silently dropped on the host until `eliminated` flipped, at which
+    -- point the player vanished mid-platform with 0 lives.
+    local SNAP_THRESHOLD_SQ = 24 * 24
+
+    local function applyLocal(p, s)
+        -- Mirrors main.lua applyNetworkState for the local player:
+        -- authoritative lives/dead/coins, position reconciled (snap only if
+        -- client prediction has drifted past threshold or on death/respawn).
+        local wasDead = p.dead
+        p.lives = s.lives; p.dead = s.dead
+        p.eliminated = s.eliminated; p.won = s.won; p.coins = s.coins
+        if s.dead and not wasDead then
+            p.x = s.x; p.y = s.y; p.vx = s.vx; p.vy = s.vy
+            p.respawnTimer = 1.5
+        elseif wasDead and not s.dead then
+            p.x = s.x; p.y = s.y; p.vx = 0; p.vy = 0
+            p.invTimer = 2.5
+        else
+            local dx, dy = p.x - s.x, p.y - s.y
+            if dx*dx + dy*dy > SNAP_THRESHOLD_SQ then
+                p.x = s.x; p.y = s.y; p.vx = s.vx; p.vy = s.vy
+            end
+        end
+    end
+
+    local function mkLocal()
+        return {
+            x=100, y=100, vx=0, vy=0,
+            lives=3, dead=false, eliminated=false, won=false, coins=0,
+            respawnTimer=0, invTimer=0,
+        }
+    end
+
+    it("syncs lives from host for local player", function()
+        local p = mkLocal()
+        applyLocal(p, {x=100,y=100,vx=0,vy=0,lives=2,dead=true,eliminated=false,won=false,coins=0})
+        assert.are.equal(p.lives, 2)
+        assert.is_true(p.dead)
+    end)
+
+    it("snaps position on dead transition", function()
+        local p = mkLocal()
+        p.x = 500; p.y = 500  -- prediction diverged far from host
+        applyLocal(p, {x=120,y=140,vx=0,vy=-300,lives=2,dead=true,eliminated=false,won=false,coins=0})
+        assert.are.equal(p.x, 120)
+        assert.are.equal(p.y, 140)
+        assert.are.equal(p.respawnTimer, 1.5)
+    end)
+
+    it("snaps position on respawn (dead -> alive)", function()
+        local p = mkLocal()
+        p.dead = true; p.x = 500; p.y = 9999
+        applyLocal(p, {x=64,y=288,vx=0,vy=0,lives=2,dead=false,eliminated=false,won=false,coins=0})
+        assert.is_false(p.dead)
+        assert.are.equal(p.x, 64)
+        assert.are.equal(p.y, 288)
+        assert.are.equal(p.invTimer, 2.5)
+    end)
+
+    it("keeps local prediction when drift is small (no rubber-band)", function()
+        -- Within the snap threshold the host state must NOT overwrite our
+        -- predicted position — that's what makes jumps feel responsive.
+        local p = mkLocal()
+        p.x = 105; p.y = 102  -- ~5.4px from host
+        applyLocal(p, {x=100,y=100,vx=0,vy=0,lives=3,dead=false,eliminated=false,won=false,coins=0})
+        assert.are.equal(p.x, 105)
+        assert.are.equal(p.y, 102)
+    end)
+
+    it("snaps to host when drift exceeds threshold", function()
+        -- Regression: the two screens used to show the same player on
+        -- different platforms because drift was never corrected.
+        local p = mkLocal()
+        p.x = 500; p.y = 500
+        applyLocal(p, {x=120,y=140,vx=10,vy=20,lives=3,dead=false,eliminated=false,won=false,coins=0})
+        assert.are.equal(p.x, 120)
+        assert.are.equal(p.y, 140)
+        assert.are.equal(p.vx, 10)
+        assert.are.equal(p.vy, 20)
+    end)
+
+    it("regression: lives never drops to 0 without dead being observed", function()
+        -- Simulate three enemy hits on the host. Before fix, client lives stayed
+        -- at 3 and the player only ever saw `eliminated` flip suddenly.
+        local p = mkLocal()
+        -- hit 1
+        applyLocal(p, {x=100,y=100,vx=0,vy=-300,lives=2,dead=true,eliminated=false,won=false,coins=0})
+        assert.are.equal(p.lives, 2)
+        assert.is_true(p.dead)
+        -- respawn
+        applyLocal(p, {x=64,y=288,vx=0,vy=0,lives=2,dead=false,eliminated=false,won=false,coins=0})
+        -- hit 2
+        applyLocal(p, {x=200,y=150,vx=0,vy=-300,lives=1,dead=true,eliminated=false,won=false,coins=0})
+        assert.are.equal(p.lives, 1)
+        -- respawn
+        applyLocal(p, {x=64,y=288,vx=0,vy=0,lives=1,dead=false,eliminated=false,won=false,coins=0})
+        -- hit 3 -> eliminated
+        applyLocal(p, {x=300,y=150,vx=0,vy=-300,lives=0,dead=true,eliminated=true,won=false,coins=0})
+        assert.are.equal(p.lives, 0)
+        assert.is_true(p.eliminated)
     end)
 
 end)
