@@ -427,27 +427,73 @@ function love.draw()
     end
 end
 
-function drawHUD(sw, sh)
-    -- Level name
-    love.graphics.setColor(0, 0, 0, 0.45)
-    love.graphics.rectangle("fill", 6, 6, 220, 16, 4, 4)
-    love.graphics.setColor(1, 1, 0.5)
-    love.graphics.print(Levels[currentLevel].name .. "  (" .. currentLevel .. "/" .. #Levels .. ")", 10, 8)
+local function drawHeart(x, y, size, r, g, b, a)
+    love.graphics.setColor(r, g, b, a or 1)
+    -- Two circles + triangle approximation of a heart
+    local s = size * 0.5
+    love.graphics.circle("fill", x - s*0.5, y, s * 0.65)
+    love.graphics.circle("fill", x + s*0.5, y, s * 0.65)
+    love.graphics.polygon("fill",
+        x - s, y + s*0.2,
+        x + s, y + s*0.2,
+        x,     y + s*1.6)
+end
 
-    -- Per-player status
-    local yy = 28
+function drawHUD(sw, sh)
+    -- Level name bar
+    local font   = love.graphics.getFont()
+    local lvlTxt = "World " .. math.ceil(currentLevel/4) .. "-" .. ((currentLevel-1)%4+1) .. ": " .. Levels[currentLevel].name
+    local barW   = font:getWidth(lvlTxt) + 20
+    love.graphics.setColor(0, 0, 0, 0.55)
+    love.graphics.rectangle("fill", 6, 6, barW, 22, 5, 5)
+    love.graphics.setColor(1, 1, 0.5)
+    love.graphics.print(lvlTxt, 16, 10)
+
+    -- Per-player cards
+    local cardW, cardH = 170, 36
+    local yy = 36
     for _, p in ipairs(players) do
         if p then
-            love.graphics.setColor(0, 0, 0, 0.4)
-            love.graphics.rectangle("fill", 6, yy, 180, 18, 3, 3)
-            love.graphics.setColor(p.color)
-            local tag = "P" .. p.id
-            if p.eliminated then tag = tag .. " [OUT]"
-            elseif p.won     then tag = tag .. " [GOAL]"
-            elseif p.dead    then tag = tag .. " [dead]"
+            -- Card background
+            love.graphics.setColor(0, 0, 0, 0.55)
+            love.graphics.rectangle("fill", 6, yy, cardW, cardH, 5, 5)
+
+            -- Player color stripe on left
+            love.graphics.setColor(p.color[1], p.color[2], p.color[3])
+            love.graphics.rectangle("fill", 6, yy, 5, cardH, 5, 0)
+
+            -- Player label
+            local label = "P" .. p.id
+            if     p.eliminated then label = label .. " OUT"
+            elseif p.won        then label = label .. " WIN"
+            elseif p.dead       then label = label .. " ×"
             end
-            love.graphics.print(tag .. "  " .. p.coins .. "c  " .. p.lives .. "♥", 10, yy + 2)
-            yy = yy + 20
+            love.graphics.setColor(1, 1, 1)
+            love.graphics.print(label, 16, yy + 4)
+
+            -- Hearts (lives)
+            local maxLives = 3
+            local hx = 16
+            local hy = yy + cardH - 14
+            for i = 1, maxLives do
+                local full = i <= p.lives
+                if full then
+                    drawHeart(hx, hy, 8, 0.95, 0.2, 0.2)
+                else
+                    drawHeart(hx, hy, 8, 0.4, 0.4, 0.4, 0.7)
+                end
+                hx = hx + 14
+            end
+
+            -- Coin icon + count
+            love.graphics.setColor(1, 0.85, 0)
+            love.graphics.circle("fill", cardW - 22, yy + cardH/2, 6)
+            love.graphics.setColor(0.8, 0.6, 0)
+            love.graphics.circle("line", cardW - 22, yy + cardH/2, 6)
+            love.graphics.setColor(1, 1, 1)
+            love.graphics.print(tostring(p.coins), cardW - 13, yy + cardH/2 - 7)
+
+            yy = yy + cardH + 4
         end
     end
 end

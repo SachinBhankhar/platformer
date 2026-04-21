@@ -50,6 +50,23 @@ love .
 
 The host runs the full simulation. Clients send inputs each frame; the host broadcasts game state at 20 Hz. LAN discovery uses UDP on port 6790.
 
+## Building for macOS
+
+```bash
+./build-macos.sh
+```
+
+Downloads the LÖVE 11.4 macOS runtime, bundles the game into `Platformer.app`, and produces `dist/Platformer-macos.zip`. The `build/` and `dist/` directories are git-ignored.
+
+> **Note:** macOS may show a Gatekeeper warning on first launch. Right-click → Open to bypass it.
+
+## Testing
+
+```bash
+busted spec/game_spec.lua   # 30 unit tests (world, collision, coins, network)
+python3 test_multiplayer.py # live two-instance multiplayer integration test
+```
+
 ## Project Structure
 
 | File | Purpose |
@@ -59,10 +76,14 @@ The host runs the full simulation. Clients send inputs each frame; the host broa
 | `world.lua` | Tile grid and AABB collision detection |
 | `levels.lua` | All 8 level definitions |
 | `enemy.lua` | Patrol AI and stomp detection |
-| `camera.lua` | Smooth camera following active players |
+| `camera.lua` | Independent per-player camera |
 | `network.lua` | ENet host/client networking |
+| `netmsg.lua` | Message pack/unpack serialization |
 | `particles.lua` | Particle system for visual effects |
 | `conf.lua` | LÖVE window configuration |
+| `build-macos.sh` | macOS binary build script |
+| `spec/game_spec.lua` | Unit test suite (busted) |
+| `test_multiplayer.py` | Multiplayer integration test |
 
 ## Levels
 
