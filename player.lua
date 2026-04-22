@@ -57,8 +57,12 @@ function Player.new(world, id)
     -- when a new player drops in, so give everyone a grace period.
     self.invTimer  = 2.5
     -- input state (filled by local keyboard or network)
-    self.input = {left=false, right=false, jump=false, run=false, jumpPressed=false}
+    self.input = {left=false, right=false, jump=false, run=false, jumpPressed=false,
+                  fire=false, firePressed=false}
     self._prevJump = false
+    self._prevFire = false
+    self.fireCooldown = 0
+    self._pendingShot = false  -- set by update; consumed by main to spawn bullet
     return self
 end
 
@@ -71,6 +75,9 @@ function Player:readLocalKeys()
     inp.jump  = keys.isDown("space") or keys.isDown("up") or keys.isDown("w")
     inp.jumpPressed = inp.jump and not self._prevJump
     self._prevJump = inp.jump
+    inp.fire = keys.isDown("lctrl") or keys.isDown("rctrl") or keys.isDown("f")
+    inp.firePressed = inp.fire and not self._prevFire
+    self._prevFire = inp.fire
 end
 
 -- Movement-only update used by the client for local prediction.
@@ -89,8 +96,15 @@ function Player:updateMovement(dt)
     end
 
     if self.invTimer > 0 then self.invTimer = self.invTimer - dt end
+    if self.fireCooldown > 0 then self.fireCooldown = self.fireCooldown - dt end
 
     local inp = self.input
+    -- Locally predict the firing cooldown so the muzzle flash & kick render
+    -- on the client at the moment of input. Host remains authoritative for
+    -- bullet spawning.
+    if inp.firePressed and self.fireCooldown <= 0 then
+        self.fireCooldown = 0.25
+    end
     local topSpeed = inp.run and RUN_SPEED or WALK_SPEED
     local moving = false
     if inp.left then
@@ -166,8 +180,16 @@ function Player:update(dt)
     end
 
     if self.invTimer > 0 then self.invTimer = self.invTimer - dt end
+    if self.fireCooldown > 0 then self.fireCooldown = self.fireCooldown - dt end
 
     local inp = self.input
+
+    -- Fire a bullet (host-authoritative: main loop consumes _pendingShot).
+    if inp.firePressed and self.fireCooldown <= 0 then
+        self._pendingShot = true
+        self.fireCooldown = 0.25
+    end
+    inp.firePressed = false
 
     -- Horizontal
     local topSpeed = inp.run and RUN_SPEED or WALK_SPEED
@@ -334,7 +356,7 @@ function Player:resetForLevel(world)
     self.invTimer    = 2.5
 end
 
-function Player:draw(camX, camY)
+function Player:draw(camX, camY, showGun)
     if self.eliminated then return end
 
     local px = self.x - camX
@@ -371,6 +393,34 @@ function Player:draw(camX, camY)
     love.graphics.rectangle("fill", eyeX, py + 3, 5, 5)
     love.graphics.setColor(0, 0, 0, alpha)
     love.graphics.rectangle("fill", eyeX + (self.facing == 1 and 2 or 0), py + 4, 3, 3)
+
+    -- Gun (drawn before legs so it sits at hip-level, extending forward)
+    if showGun and not self.dead then
+        local hipY   = py + self.h - 14
+        local barrelLen = 10
+        local bodyLen   = 6
+        local kick = self.fireCooldown and self.fireCooldown > 0.15 and 2 or 0
+        local baseX = self.facing == 1 and (px + self.w - 2 - kick)
+                                        or (px + 2 + kick)
+        -- Grip
+        love.graphics.setColor(0.25, 0.25, 0.28, alpha)
+        love.graphics.rectangle("fill",
+            self.facing == 1 and baseX or baseX - bodyLen,
+            hipY, bodyLen, 5)
+        -- Barrel
+        love.graphics.setColor(0.55, 0.55, 0.6, alpha)
+        love.graphics.rectangle("fill",
+            self.facing == 1 and (baseX + bodyLen - 1) or (baseX - bodyLen - barrelLen + 1),
+            hipY + 1, barrelLen, 3)
+        -- Muzzle flash during the first ~0.1s of cooldown after firing
+        if self.fireCooldown and self.fireCooldown > 0.15 then
+            love.graphics.setColor(1, 0.9, 0.3, alpha)
+            local muzzleX = self.facing == 1
+                and (baseX + bodyLen + barrelLen - 1)
+                or  (baseX - bodyLen - barrelLen - 2)
+            love.graphics.rectangle("fill", muzzleX, hipY, 4, 5)
+        end
+    end
 
     -- Legs
     love.graphics.setColor(c[1]*0.5, c[2]*0.5, c[3]*0.5)

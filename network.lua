@@ -64,7 +64,7 @@ end
 -- ── Host update ──────────────────────────────────────────────────────────────
 
 -- Call each frame. Returns list of {type, peer_or_id, data} events.
-function Network:hostUpdate(dt, players, world, enemies, currentLevel)
+function Network:hostUpdate(dt, players, world, enemies, currentLevel, bullets)
     local events = {}
 
     -- Handle discovery broadcast
@@ -93,7 +93,7 @@ function Network:hostUpdate(dt, players, world, enemies, currentLevel)
             self.nextId = self.nextId + 1
             self.peers[ev.peer] = id
             -- Tell new client their ID and current level
-            ev.peer:send(pack({"JOIN", id, currentLevel}), 0, "reliable")
+            ev.peer:send(pack({"JOIN", id, currentLevel, self.gunMode and 1 or 0}), 0, "reliable")
             events[#events+1] = {type="join", id=id, peer=ev.peer}
             print("[NET] Player " .. id .. " joined")
         elseif ev.type == "disconnect" then
@@ -107,7 +107,9 @@ function Network:hostUpdate(dt, players, world, enemies, currentLevel)
             local ok2, d = pcall(unpack_msg, ev.data)
             if ok2 and d[1] == "INPUT" then
                 local id = self.peers[ev.peer]
-                events[#events+1] = {type="input", id=id, left=d[2]==1, right=d[3]==1, jump=d[4]==1, run=d[5]==1, jumpPressed=d[6]==1}
+                events[#events+1] = {type="input", id=id,
+                    left=d[2]==1, right=d[3]==1, jump=d[4]==1, run=d[5]==1,
+                    jumpPressed=d[6]==1, fire=d[7]==1, firePressed=d[8]==1}
             end
         end
     end
@@ -116,7 +118,7 @@ function Network:hostUpdate(dt, players, world, enemies, currentLevel)
     self.tickTimer = self.tickTimer + dt
     if self.tickTimer >= 1/TICK_RATE then
         self.tickTimer = 0
-        local msg = self:buildStateMsg(players, enemies)
+        local msg = self:buildStateMsg(players, enemies, bullets or {})
         for peer, _ in pairs(self.peers) do
             peer:send(msg, 0, "unreliable")
         end
@@ -125,9 +127,10 @@ function Network:hostUpdate(dt, players, world, enemies, currentLevel)
     return events
 end
 
--- Expects `enemies` to be a flat list where each entry has a `.level` field
--- (so clients can tell which level each enemy belongs to).
-function Network:buildStateMsg(players, enemies)
+-- Expects `enemies` and `bullets` to be flat lists where each entry has a
+-- `.level` field (so clients can tell which level each entity belongs to).
+function Network:buildStateMsg(players, enemies, bullets)
+    bullets = bullets or {}
     local parts = {"STATE", #players}
     for _, p in ipairs(players) do
         parts[#parts+1] = p.id
@@ -154,6 +157,13 @@ function Network:buildStateMsg(players, enemies)
         parts[#parts+1] = e.dead and 1 or 0
         parts[#parts+1] = string.format("%.2f", e.deadTimer)
     end
+    parts[#parts+1] = #bullets
+    for _, b in ipairs(bullets) do
+        parts[#parts+1] = b.level or 1
+        parts[#parts+1] = math.floor(b.x)
+        parts[#parts+1] = math.floor(b.y)
+        parts[#parts+1] = math.floor(b.vx)
+    end
     return pack(parts)
 end
 
@@ -167,8 +177,10 @@ function Network:clientUpdate(dt, inputs)
     -- so send reliably on that edge — otherwise a single dropped UDP packet
     -- eats the jump and the client's prediction diverges from the host.
     if self.myId then
-        local msg = pack({"INPUT", inputs.left, inputs.right, inputs.jump, inputs.run, inputs.jumpPressed})
-        local chan = inputs.jumpPressed and "reliable" or "unreliable"
+        local msg = pack({"INPUT",
+            inputs.left, inputs.right, inputs.jump, inputs.run, inputs.jumpPressed,
+            inputs.fire or false, inputs.firePressed or false})
+        local chan = (inputs.jumpPressed or inputs.firePressed) and "reliable" or "unreliable"
         self.server:send(msg, 0, chan)
     end
 
@@ -184,12 +196,12 @@ function Network:clientUpdate(dt, inputs)
             if ok2 then
                 if d[1] == "JOIN" then
                     self.myId = d[2]
-                    events[#events+1] = {type="join", id=d[2], level=d[3]}
+                    events[#events+1] = {type="join", id=d[2], level=d[3], gunMode=d[4]==1}
                     print("[NET] Assigned player ID " .. d[2])
                 elseif d[1] == "STATE" then
                     events[#events+1] = {type="state", data=d}
                 elseif d[1] == "LEVEL" then
-                    events[#events+1] = {type="level", num=d[2]}
+                    events[#events+1] = {type="level", num=d[2], gunMode=d[3]==1}
                 elseif d[1] == "COIN" then
                     events[#events+1] = {type="coin", tx=d[2], ty=d[3], level=d[4] or 1}
                 end
@@ -225,9 +237,10 @@ end
 -- Send a LEVEL change message to a single peer (used for mid-game joins
 -- so the new client knows which level the host is currently on).
 function Network:sendLevelTo(playerId, num)
+    local g = self.gunMode and 1 or 0
     for peer, id in pairs(self.peers) do
         if id == playerId then
-            peer:send(pack({"LEVEL", num}), 0, "reliable")
+            peer:send(pack({"LEVEL", num, g}), 0, "reliable")
             return
         end
     end
@@ -235,8 +248,9 @@ end
 
 -- Broadcast level change to all clients (host only)
 function Network:broadcastLevel(num)
+    local g = self.gunMode and 1 or 0
     for peer, _ in pairs(self.peers) do
-        peer:send(pack({"LEVEL", num}), 0, "reliable")
+        peer:send(pack({"LEVEL", num, g}), 0, "reliable")
     end
 end
 

@@ -5,6 +5,7 @@ local Camera    = require "camera"
 local Particles = require "particles"
 local Levels    = require "levels"
 local Network   = require "network"
+local Bullet    = require "bullet"
 
 -- ── Game state ───────────────────────────────────────────────────────────────
 -- States: "menu"  "lobby"  "playing"  "game_over"
@@ -16,7 +17,9 @@ local levelInstances = {}
 
 -- Current render view (= local player's level). These are aliases into
 -- levelInstances for whatever level the local player is currently on.
-local world, enemies, bgStars
+-- `bullets` on host/solo aliases the current level's bullet list; on client
+-- it's rebuilt each STATE snapshot from the host's flat bullet array.
+local world, enemies, bgStars, bullets
 local camera, particles
 local players = {}
 local totalCoins   = 0
@@ -25,6 +28,9 @@ local localPlayerId = 1
 
 local net = nil
 local isHost = true
+-- Global mode flag: classic platformer vs gun-enabled. Toggled from menu.
+-- Synced from host to clients via JOIN and LEVEL messages.
+local gunMode = false
 
 -- Lobby UI
 local lobbyInput = ""
@@ -58,7 +64,7 @@ local function getLevelInstance(lvl)
         e.level = lvl
         es[#es+1] = e
     end
-    inst = { world = w, enemies = es, stars = makeStarsFor(w) }
+    inst = { world = w, enemies = es, bullets = {}, stars = makeStarsFor(w) }
     levelInstances[lvl] = inst
     return inst
 end
@@ -68,6 +74,7 @@ local function setLocalView(lvl)
     local inst = getLevelInstance(lvl)
     world   = inst.world
     enemies = inst.enemies
+    bullets = inst.bullets
     bgStars = inst.stars
     camera  = Camera.new(world)
     totalCoins = world:countCoins()
@@ -89,6 +96,17 @@ local function allEnemiesFlat()
         for _, e in ipairs(inst.enemies) do
             e.level = lvl
             list[#list+1] = e
+        end
+    end
+    return list
+end
+
+local function allBulletsFlat()
+    local list = {}
+    for lvl, inst in pairs(levelInstances) do
+        for _, b in ipairs(inst.bullets) do
+            b.level = lvl
+            list[#list+1] = b
         end
     end
     return list
@@ -214,25 +232,41 @@ local function applyNetworkState(data)
                 setLocalView(lvl)
                 p.world = world
                 p.bannerTimer = LEVEL_BANNER_TIME
-                -- Match the host-side spawn-protection window so the
-                -- blink/invuln feels consistent locally.
                 p.invTimer = 2.5
-            end
-            -- Client-side prediction with reconciliation.
-            if dead and not wasDead then
+                p.x = x; p.y = y; p.vx = vx; p.vy = vy
+            elseif dead and not wasDead then
                 p.x = x; p.y = y; p.vx = vx; p.vy = vy
                 p.respawnTimer = 1.5
             elseif wasDead and not dead then
                 p.x = x; p.y = y; p.vx = 0; p.vy = 0
                 p.invTimer = 2.5
             else
-                local dx, dy = p.x - x, p.y - y
-                if dx*dx + dy*dy > 24*24 then
+                -- Client-side prediction with smooth reconciliation. Under
+                -- latency the client is always slightly ahead of the host
+                -- snapshot, so hard-snapping every frame feels like rubber-
+                -- banding. Small drift: blend gently toward the server pos.
+                -- Large drift (teleport/warp): hard-snap.
+                local dx, dy = x - p.x, y - p.y
+                local d2 = dx*dx + dy*dy
+                if d2 > 128*128 then
                     p.x = x; p.y = y; p.vx = vx; p.vy = vy
+                else
+                    p.x = p.x + dx * 0.18
+                    p.y = p.y + dy * 0.18
+                    -- Velocity: trust server more, blends in grounding/jumps.
+                    p.vx = p.vx * 0.5 + vx * 0.5
+                    p.vy = p.vy * 0.5 + vy * 0.5
                 end
             end
         else
-            p.x = x; p.y = y; p.vx = vx; p.vy = vy
+            -- Remote players: snapshot the host-authoritative position as a
+            -- target; the main loop lerps toward it each frame so motion is
+            -- smooth between the 60Hz STATE ticks instead of stepping.
+            p.targetX, p.targetY = x, y
+            if not p._hasInit then
+                p.x = x; p.y = y; p._hasInit = true
+            end
+            p.vx = vx; p.vy = vy
             p.facing = facing; p.onGround = onGround; p.walkFrame = walkFrame
         end
     end
@@ -262,6 +296,27 @@ local function applyNetworkState(data)
     local k = 1
     while k <= #enemies do
         if seen[enemies[k].id] then k = k + 1 else table.remove(enemies, k) end
+    end
+
+    -- Bullets: fully replace the local list each snapshot (they're ephemeral
+    -- and unordered, no need to track ids).
+    local bcount = data[i]; i = i + 1
+    if bcount then
+        local newBullets = {}
+        for _ = 1, bcount do
+            local blvl = data[i]; i = i + 1
+            local bx   = data[i]; i = i + 1
+            local by   = data[i]; i = i + 1
+            local bvx  = data[i]; i = i + 1
+            if blvl == currentLevel then
+                newBullets[#newBullets+1] = {x=bx, y=by, vx=bvx, w=6, h=4}
+            end
+        end
+        bullets = newBullets
+        -- Keep the current level instance's bullet list in sync so a later
+        -- setLocalView call (or host/solo draw path) reads the same data.
+        local inst = levelInstances[currentLevel]
+        if inst then inst.bullets = newBullets end
     end
 end
 
@@ -311,7 +366,7 @@ function love.update(dt)
         if isHost then
             local lp = players[localPlayerId]
             if lp then lp:readLocalKeys() end
-            local evts = net:hostUpdate(dt, activePlayers(), world, allEnemiesFlat(), currentLevel)
+            local evts = net:hostUpdate(dt, activePlayers(), world, allEnemiesFlat(), currentLevel, allBulletsFlat())
             for _, ev in ipairs(evts) do
                 if ev.type == "join" then
                     if not players[ev.id] then addPlayer(ev.id) end
@@ -329,14 +384,16 @@ function love.update(dt)
                         p.input.right = ev.right
                         p.input.jump  = ev.jump
                         p.input.run   = ev.run
+                        p.input.fire  = ev.fire or false
                         if ev.jumpPressed then p.input.jumpPressed = true end
+                        if ev.firePressed then p.input.firePressed = true end
                     end
                 end
             end
         else
             local lp = players[localPlayerId]
             if lp then lp:readLocalKeys() end
-            local inp = lp and lp.input or {left=false,right=false,jump=false,run=false,jumpPressed=false}
+            local inp = lp and lp.input or {left=false,right=false,jump=false,run=false,jumpPressed=false,fire=false,firePressed=false}
             local prevCoins = lp and lp.coins or 0
 
             local evts = net:clientUpdate(dt, inp)
@@ -354,6 +411,7 @@ function love.update(dt)
                 elseif ev.type == "level" then
                     -- Host -> client lobby-to-playing signal. Start level 1.
                     setLocalView(ev.num or 1)
+                    if ev.gunMode ~= nil then gunMode = ev.gunMode end
                 elseif ev.type == "disconnect" then
                     lobbyMsg = "Disconnected from host"
                     state = "menu"
@@ -366,6 +424,18 @@ function love.update(dt)
 
             if lp and not lp.eliminated and not lp.dead then
                 lp:updateMovement(dt)
+            end
+            -- Smooth remote players toward their server-authoritative target
+            -- between 60Hz STATE ticks (keeps motion from stepping).
+            for _, p in ipairs(players) do
+                if p and p.id ~= localPlayerId and p.targetX then
+                    local k = math.min(1, dt * 18)
+                    p.x = p.x + (p.targetX - p.x) * k
+                    p.y = p.y + (p.targetY - p.y) * k
+                    if p.bannerTimer and p.bannerTimer > 0 then
+                        p.bannerTimer = p.bannerTimer - dt
+                    end
+                end
             end
             if lp and lp.bannerTimer > 0 then lp.bannerTimer = lp.bannerTimer - dt end
             particles:update(dt)
@@ -433,6 +503,23 @@ function love.update(dt)
         end
     end
 
+    -- Spawn bullets for any player whose update() set _pendingShot.
+    -- Gated by gunMode so classic mode never produces bullets even if the
+    -- client spammed the fire key.
+    for _, p in ipairs(players) do
+        if p and not p.eliminated and p._pendingShot then
+            p._pendingShot = false
+            if gunMode then
+                local inst = getLevelInstance(p.level)
+                local bx = p.facing == 1 and (p.x + p.w) or (p.x - 6)
+                local by = p.y + p.h/2 - 2
+                local b = Bullet.new(bx, by, p.facing, p.id)
+                b.level = p.level
+                inst.bullets[#inst.bullets+1] = b
+            end
+        end
+    end
+
     -- Enemy updates: each level's enemies see only players on that level.
     for lvl, inst in pairs(levelInstances) do
         local group = playersOnLevel(lvl)
@@ -446,6 +533,17 @@ function love.update(dt)
                 table.remove(inst.enemies, i)
             else
                 i = i + 1
+            end
+        end
+        -- Bullets: collide with world tiles / enemies. Enemy kills happen
+        -- inside Bullet:update (sets e.dead; the enemy loop above will reap
+        -- it next tick after the death animation).
+        local bi = 1
+        while bi <= #inst.bullets do
+            if inst.bullets[bi]:update(dt, inst.world, inst.enemies) then
+                bi = bi + 1
+            else
+                table.remove(inst.bullets, bi)
             end
         end
     end
@@ -493,9 +591,12 @@ function updateLobby(dt)
             if ev.type == "join" then
                 localPlayerId = ev.id
                 addPlayer(ev.id)
-                lobbyMsg = "Connected! You are Player " .. ev.id .. ". Waiting for host..."
+                if ev.gunMode ~= nil then gunMode = ev.gunMode end
+                lobbyMsg = "Connected! You are Player " .. ev.id ..
+                    " (" .. (gunMode and "GUN" or "CLASSIC") .. " mode). Waiting for host..."
             elseif ev.type == "level" then
                 setLocalView(ev.num or 1)
+                if ev.gunMode ~= nil then gunMode = ev.gunMode end
                 state = "playing"
             end
         end
@@ -526,10 +627,20 @@ function love.draw()
 
     world:draw(cx, cy, sw, sh)
     for _, e in ipairs(enemies) do e:draw(cx, cy) end
+    if bullets then
+        for _, b in ipairs(bullets) do
+            love.graphics.setColor(1, 0.95, 0.3)
+            love.graphics.rectangle("fill", b.x - cx, b.y - cy, b.w or 6, b.h or 4)
+            love.graphics.setColor(1, 0.7, 0, 0.5)
+            love.graphics.rectangle("fill",
+                b.x - cx - ((b.vx or 0) > 0 and 4 or -(b.w or 6)),
+                b.y - cy + 1, 4, (b.h or 4) - 2)
+        end
+    end
     particles:draw(cx, cy)
     -- Only render players on our level.
     for _, p in ipairs(players) do
-        if p and p.level == currentLevel then p:draw(cx, cy) end
+        if p and p.level == currentLevel then p:draw(cx, cy, gunMode) end
     end
 
     drawHUD(sw, sh)
@@ -648,8 +759,14 @@ function drawMenu(sw, sh)
     love.graphics.printf("[S]  Solo Play", 0, sh/2 - 30, sw, "center")
     love.graphics.printf("[H]  Host Multiplayer", 0, sh/2, sw, "center")
     love.graphics.printf("[J]  Join Game (LAN)", 0, sh/2 + 30, sw, "center")
+    love.graphics.setColor(gunMode and {0.4, 1, 0.4} or {0.8, 0.8, 0.8})
+    love.graphics.printf("[G]  Gun Mode: " .. (gunMode and "ON" or "OFF"),
+        0, sh/2 + 70, sw, "center")
     love.graphics.setColor(0.6, 0.6, 0.6)
-    love.graphics.printf("ESC to quit", 0, sh/2 + 80, sw, "center")
+    love.graphics.printf("Arrows/WASD move  -  Space jump  -  Shift run" ..
+        (gunMode and "  -  Ctrl/F shoot" or ""),
+        0, sh/2 + 100, sw, "center")
+    love.graphics.printf("ESC to quit", 0, sh/2 + 130, sw, "center")
 end
 
 function drawLobby(sw, sh)
@@ -724,6 +841,7 @@ function love.keypressed(key)
             local p = Player.new(world, 1); p.level = 1
             players[1]    = p
             net           = Network.newHost()
+            net.gunMode   = gunMode
             lobbyMode     = "host"
             lobbyMsg      = "Waiting for players..."
             state         = "lobby"
@@ -732,6 +850,8 @@ function love.keypressed(key)
             lobbyInput = ""
             lobbyMsg   = ""
             state      = "lobby"
+        elseif key == "g" then
+            gunMode = not gunMode
         end
         return
     end
