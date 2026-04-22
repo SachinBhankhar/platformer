@@ -28,6 +28,8 @@ local localPlayerId = 1
 
 local net = nil
 local isHost = true
+local freezeReadySound = nil
+local _prevFreezeCd = 0  -- local player's previous-frame freeze cooldown
 -- Global mode flag: classic platformer vs gun-enabled. Toggled from menu.
 -- Synced from host to clients via JOIN and LEVEL messages.
 local gunMode = false
@@ -216,6 +218,7 @@ local function applyNetworkState(data)
         local onGround = data[i]==1; i = i + 1
         local walkFrame= data[i];   i = i + 1
         local coins    = data[i];   i = i + 1
+        local freezeCd = tonumber(data[i]) or 0; i = i + 1
         if not players[id] then
             players[id] = Player.new(world, id)
             players[id].level = lvl
@@ -226,6 +229,7 @@ local function applyNetworkState(data)
         p.lives = lives; p.dead = dead
         p.eliminated = elim; p.won = won; p.coins = coins
         p.level = lvl
+        p.freezeCooldown = freezeCd
         if id == localPlayerId then
             -- If the host advanced us to a new level, switch our view.
             if lvl ~= currentLevel then
@@ -281,6 +285,8 @@ local function applyNetworkState(data)
         local ey   = data[i]; i = i + 1
         local edead= data[i]==1; i = i + 1
         local edt  = data[i]; i = i + 1
+        local efroz= data[i]==1; i = i + 1
+        local eft  = tonumber(data[i]) or 0; i = i + 1
         if elvl == currentLevel then
             seen[eid] = true
             local found
@@ -290,6 +296,7 @@ local function applyNetworkState(data)
             if found then
                 found.x = ex; found.y = ey
                 found.dead = edead; found.deadTimer = edt
+                found.frozen = efroz; found.frozenTimer = eft
             end
         end
     end
@@ -308,8 +315,11 @@ local function applyNetworkState(data)
             local bx   = data[i]; i = i + 1
             local by   = data[i]; i = i + 1
             local bvx  = data[i]; i = i + 1
+            local btyp = data[i]; i = i + 1
             if blvl == currentLevel then
-                newBullets[#newBullets+1] = {x=bx, y=by, vx=bvx, w=6, h=4}
+                local bw = btyp == Bullet.TYPE_FREEZE and 10 or 6
+                local bh = btyp == Bullet.TYPE_FREEZE and 6 or 4
+                newBullets[#newBullets+1] = {x=bx, y=by, vx=bvx, w=bw, h=bh, type=btyp}
             end
         end
         bullets = newBullets
@@ -328,6 +338,22 @@ function love.load()
     -- Minimal init so we can draw the menu immediately
     setLocalView(1)
     particles = Particles.new()
+
+    -- Procedural two-tone ding for when the freeze power is available again.
+    local rate = 44100
+    local dur  = 0.35
+    local samples = math.floor(rate * dur)
+    local sd = love.sound.newSoundData(samples, rate, 16, 1)
+    for i = 0, samples - 1 do
+        local t = i / rate
+        -- First tone (880Hz) for first half, then second tone (1320Hz).
+        local freq = t < dur/2 and 880 or 1320
+        local localT = t < dur/2 and t or (t - dur/2)
+        local env = math.exp(-localT * 12)
+        local s = math.sin(2 * math.pi * freq * localT) * env * 0.4
+        sd:setSample(i, s)
+    end
+    freezeReadySound = love.audio.newSource(sd, "static")
 end
 
 local function advancePlayerIfWon(p)
@@ -387,6 +413,7 @@ function love.update(dt)
                         p.input.fire  = ev.fire or false
                         if ev.jumpPressed then p.input.jumpPressed = true end
                         if ev.firePressed then p.input.firePressed = true end
+                        if ev.freezePressed then p.input.freezePressed = true end
                     end
                 end
             end
@@ -441,6 +468,13 @@ function love.update(dt)
             particles:update(dt)
             local sw, sh = love.graphics.getDimensions()
             if lp then camera:follow({lp}, sw, sh) end
+            if lp then
+                local cd = lp.freezeCooldown or 0
+                if _prevFreezeCd > 0 and cd <= 0 and freezeReadySound and not gunMode then
+                    freezeReadySound:stop(); freezeReadySound:play()
+                end
+                _prevFreezeCd = cd
+            end
             return
         end
     else
@@ -518,6 +552,17 @@ function love.update(dt)
                 inst.bullets[#inst.bullets+1] = b
             end
         end
+        if p and not p.eliminated and p._pendingFreezeShot then
+            p._pendingFreezeShot = false
+            if not gunMode then
+                local inst = getLevelInstance(p.level)
+                local bx = p.facing == 1 and (p.x + p.w) or (p.x - 10)
+                local by = p.y + p.h/2 - 3
+                local b = Bullet.new(bx, by, p.facing, p.id, Bullet.TYPE_FREEZE)
+                b.level = p.level
+                inst.bullets[#inst.bullets+1] = b
+            end
+        end
     end
 
     -- Enemy updates: each level's enemies see only players on that level.
@@ -565,6 +610,15 @@ function love.update(dt)
     if lp and lp.level ~= currentLevel then
         setLocalView(lp.level)
         lp.world = world
+    end
+
+    -- Freeze-ready chime: cooldown ticked from >0 to <=0 for local player.
+    if lp then
+        local cd = lp.freezeCooldown or 0
+        if _prevFreezeCd > 0 and cd <= 0 and freezeReadySound and not gunMode then
+            freezeReadySound:stop(); freezeReadySound:play()
+        end
+        _prevFreezeCd = cd
     end
 
     -- Global end conditions.
@@ -629,12 +683,21 @@ function love.draw()
     for _, e in ipairs(enemies) do e:draw(cx, cy) end
     if bullets then
         for _, b in ipairs(bullets) do
-            love.graphics.setColor(1, 0.95, 0.3)
-            love.graphics.rectangle("fill", b.x - cx, b.y - cy, b.w or 6, b.h or 4)
-            love.graphics.setColor(1, 0.7, 0, 0.5)
-            love.graphics.rectangle("fill",
-                b.x - cx - ((b.vx or 0) > 0 and 4 or -(b.w or 6)),
-                b.y - cy + 1, 4, (b.h or 4) - 2)
+            if b.type == Bullet.TYPE_FREEZE then
+                love.graphics.setColor(0.7, 0.95, 1.0)
+                love.graphics.rectangle("fill", b.x - cx, b.y - cy, b.w or 10, b.h or 6)
+                love.graphics.setColor(0.4, 0.8, 1.0, 0.6)
+                love.graphics.rectangle("fill",
+                    b.x - cx - ((b.vx or 0) > 0 and 6 or -(b.w or 10)),
+                    b.y - cy + 1, 6, (b.h or 6) - 2)
+            else
+                love.graphics.setColor(1, 0.95, 0.3)
+                love.graphics.rectangle("fill", b.x - cx, b.y - cy, b.w or 6, b.h or 4)
+                love.graphics.setColor(1, 0.7, 0, 0.5)
+                love.graphics.rectangle("fill",
+                    b.x - cx - ((b.vx or 0) > 0 and 4 or -(b.w or 6)),
+                    b.y - cy + 1, 4, (b.h or 4) - 2)
+            end
         end
     end
     particles:draw(cx, cy)
@@ -701,6 +764,24 @@ function drawHUD(sw, sh)
     local lp     = players[localPlayerId]
     local hudLvl = (lp and lp.level) or currentLevel
     local lvlTxt = "World " .. math.ceil(hudLvl/4) .. "-" .. ((hudLvl-1)%4+1) .. ": " .. Levels[hudLvl].name
+
+    -- Freeze power indicator (top-center).
+    if (not gunMode) and lp then
+        local cd = lp.freezeCooldown or 0
+        local txt, col
+        if cd <= 0 then
+            txt = "FREEZE READY [Q]"
+            col = {0.5, 0.95, 1.0}
+        else
+            txt = string.format("FREEZE: %ds", math.ceil(cd))
+            col = {0.5, 0.5, 0.55}
+        end
+        local w = font:getWidth(txt) + 20
+        love.graphics.setColor(0, 0, 0, 0.55)
+        love.graphics.rectangle("fill", sw/2 - w/2, 6, w, 22, 5, 5)
+        love.graphics.setColor(col)
+        love.graphics.printf(txt, sw/2 - w/2, 10, w, "center")
+    end
     local barW   = font:getWidth(lvlTxt) + 20
     love.graphics.setColor(0, 0, 0, 0.55)
     love.graphics.rectangle("fill", 6, 6, barW, 22, 5, 5)
@@ -764,7 +845,7 @@ function drawMenu(sw, sh)
         0, sh/2 + 70, sw, "center")
     love.graphics.setColor(0.6, 0.6, 0.6)
     love.graphics.printf("Arrows/WASD move  -  Space jump  -  Shift run" ..
-        (gunMode and "  -  Ctrl/F shoot" or ""),
+        (gunMode and "  -  Ctrl/F shoot" or "  -  Q freeze enemy"),
         0, sh/2 + 100, sw, "center")
     love.graphics.printf("ESC to quit", 0, sh/2 + 130, sw, "center")
 end

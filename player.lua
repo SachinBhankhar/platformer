@@ -58,11 +58,14 @@ function Player.new(world, id)
     self.invTimer  = 2.5
     -- input state (filled by local keyboard or network)
     self.input = {left=false, right=false, jump=false, run=false, jumpPressed=false,
-                  fire=false, firePressed=false}
+                  fire=false, firePressed=false, freeze=false, freezePressed=false}
     self._prevJump = false
     self._prevFire = false
+    self._prevFreeze = false
     self.fireCooldown = 0
-    self._pendingShot = false  -- set by update; consumed by main to spawn bullet
+    self.freezeCooldown = 0
+    self._pendingShot = false        -- consumed by main to spawn normal bullet
+    self._pendingFreezeShot = false  -- consumed by main to spawn freeze bullet
     return self
 end
 
@@ -78,6 +81,9 @@ function Player:readLocalKeys()
     inp.fire = keys.isDown("lctrl") or keys.isDown("rctrl") or keys.isDown("f")
     inp.firePressed = inp.fire and not self._prevFire
     self._prevFire = inp.fire
+    inp.freeze = keys.isDown("q")
+    inp.freezePressed = inp.freeze and not self._prevFreeze
+    self._prevFreeze = inp.freeze
 end
 
 -- Movement-only update used by the client for local prediction.
@@ -97,6 +103,7 @@ function Player:updateMovement(dt)
 
     if self.invTimer > 0 then self.invTimer = self.invTimer - dt end
     if self.fireCooldown > 0 then self.fireCooldown = self.fireCooldown - dt end
+    if self.freezeCooldown > 0 then self.freezeCooldown = self.freezeCooldown - dt end
 
     local inp = self.input
     -- Locally predict the firing cooldown so the muzzle flash & kick render
@@ -104,6 +111,9 @@ function Player:updateMovement(dt)
     -- bullet spawning.
     if inp.firePressed and self.fireCooldown <= 0 then
         self.fireCooldown = 0.25
+    end
+    if inp.freezePressed and self.freezeCooldown <= 0 then
+        self.freezeCooldown = 30
     end
     local topSpeed = inp.run and RUN_SPEED or WALK_SPEED
     local moving = false
@@ -181,6 +191,7 @@ function Player:update(dt)
 
     if self.invTimer > 0 then self.invTimer = self.invTimer - dt end
     if self.fireCooldown > 0 then self.fireCooldown = self.fireCooldown - dt end
+    if self.freezeCooldown > 0 then self.freezeCooldown = self.freezeCooldown - dt end
 
     local inp = self.input
 
@@ -190,6 +201,13 @@ function Player:update(dt)
         self.fireCooldown = 0.25
     end
     inp.firePressed = false
+
+    -- Freeze shot: 30s cooldown power.
+    if inp.freezePressed and self.freezeCooldown <= 0 then
+        self._pendingFreezeShot = true
+        self.freezeCooldown = 30
+    end
+    inp.freezePressed = false
 
     -- Horizontal
     local topSpeed = inp.run and RUN_SPEED or WALK_SPEED

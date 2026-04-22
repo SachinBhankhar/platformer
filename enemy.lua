@@ -15,8 +15,10 @@ function Enemy.new(world, tx, ty)
     self.h         = 24
     self.vx        = -SPEED
     self.vy        = 0
-    self.dead      = false
-    self.deadTimer = 0
+    self.dead        = false
+    self.deadTimer   = 0
+    self.frozen      = false
+    self.frozenTimer = 0
     return self
 end
 
@@ -25,6 +27,31 @@ function Enemy:update(dt, players)
     if self.dead then
         self.deadTimer = self.deadTimer + dt
         return self.deadTimer < 0.4
+    end
+
+    if self.frozen then
+        self.frozenTimer = self.frozenTimer - dt
+        if self.frozenTimer <= 0 then
+            self.frozen = false
+            self.frozenTimer = 0
+        end
+        -- Frozen enemies don't move, don't fall, don't kill players — but
+        -- can still be stomped to finish them off.
+        for _, player in ipairs(players) do
+            if not player.dead and not player.won and not player.eliminated then
+                if self:overlaps(player) then
+                    local playerFeet = player.y + player.h
+                    local enemyMid   = self.y + self.h / 2
+                    if player.vy > 0 and playerFeet <= enemyMid + 10 then
+                        self.dead = true
+                        player.vy = STOMP_KILL_VY
+                        player.coins = player.coins + 1
+                        return true
+                    end
+                end
+            end
+        end
+        return true
     end
 
     self.vy = self.vy + GRAVITY * dt
@@ -85,8 +112,23 @@ function Enemy:draw(camX, camY)
         return
     end
 
-    love.graphics.setColor(0.6, 0.3, 0.0)
+    if self.frozen then
+        love.graphics.setColor(0.5, 0.8, 1.0)
+    else
+        love.graphics.setColor(0.6, 0.3, 0.0)
+    end
     love.graphics.ellipse("fill", px + self.w/2, py + self.h/2 + 4, self.w/2, self.h/2 - 2)
+
+    if self.frozen then
+        -- Frosty overlay + little icicle "crystal" on top
+        love.graphics.setColor(1, 1, 1, 0.35)
+        love.graphics.rectangle("fill", px, py, self.w, self.h)
+        love.graphics.setColor(0.8, 0.95, 1.0, 0.9)
+        love.graphics.polygon("fill",
+            px + self.w/2, py - 6,
+            px + self.w/2 - 3, py,
+            px + self.w/2 + 3, py)
+    end
 
     love.graphics.setColor(1, 1, 1)
     love.graphics.circle("fill", px + 6,  py + self.h/2 - 2, 4)

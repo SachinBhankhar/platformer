@@ -109,7 +109,8 @@ function Network:hostUpdate(dt, players, world, enemies, currentLevel, bullets)
                 local id = self.peers[ev.peer]
                 events[#events+1] = {type="input", id=id,
                     left=d[2]==1, right=d[3]==1, jump=d[4]==1, run=d[5]==1,
-                    jumpPressed=d[6]==1, fire=d[7]==1, firePressed=d[8]==1}
+                    jumpPressed=d[6]==1, fire=d[7]==1, firePressed=d[8]==1,
+                    freezePressed=d[9]==1}
             end
         end
     end
@@ -147,6 +148,7 @@ function Network:buildStateMsg(players, enemies, bullets)
         parts[#parts+1] = p.onGround and 1 or 0
         parts[#parts+1] = p.walkFrame
         parts[#parts+1] = p.coins
+        parts[#parts+1] = string.format("%.2f", p.freezeCooldown or 0)
     end
     parts[#parts+1] = #enemies
     for _, e in ipairs(enemies) do
@@ -156,6 +158,8 @@ function Network:buildStateMsg(players, enemies, bullets)
         parts[#parts+1] = math.floor(e.y)
         parts[#parts+1] = e.dead and 1 or 0
         parts[#parts+1] = string.format("%.2f", e.deadTimer)
+        parts[#parts+1] = e.frozen and 1 or 0
+        parts[#parts+1] = string.format("%.2f", e.frozenTimer or 0)
     end
     parts[#parts+1] = #bullets
     for _, b in ipairs(bullets) do
@@ -163,6 +167,7 @@ function Network:buildStateMsg(players, enemies, bullets)
         parts[#parts+1] = math.floor(b.x)
         parts[#parts+1] = math.floor(b.y)
         parts[#parts+1] = math.floor(b.vx)
+        parts[#parts+1] = b.type or 1
     end
     return pack(parts)
 end
@@ -179,8 +184,9 @@ function Network:clientUpdate(dt, inputs)
     if self.myId then
         local msg = pack({"INPUT",
             inputs.left, inputs.right, inputs.jump, inputs.run, inputs.jumpPressed,
-            inputs.fire or false, inputs.firePressed or false})
-        local chan = (inputs.jumpPressed or inputs.firePressed) and "reliable" or "unreliable"
+            inputs.fire or false, inputs.firePressed or false,
+            inputs.freezePressed or false})
+        local chan = (inputs.jumpPressed or inputs.firePressed or inputs.freezePressed) and "reliable" or "unreliable"
         self.server:send(msg, 0, chan)
     end
 
