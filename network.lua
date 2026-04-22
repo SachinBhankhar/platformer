@@ -116,7 +116,7 @@ function Network:hostUpdate(dt, players, world, enemies, currentLevel)
     self.tickTimer = self.tickTimer + dt
     if self.tickTimer >= 1/TICK_RATE then
         self.tickTimer = 0
-        local msg = self:buildStateMsg(players, enemies, currentLevel)
+        local msg = self:buildStateMsg(players, enemies)
         for peer, _ in pairs(self.peers) do
             peer:send(msg, 0, "unreliable")
         end
@@ -125,10 +125,13 @@ function Network:hostUpdate(dt, players, world, enemies, currentLevel)
     return events
 end
 
-function Network:buildStateMsg(players, enemies, currentLevel)
-    local parts = {"STATE", currentLevel, #players}
+-- Expects `enemies` to be a flat list where each entry has a `.level` field
+-- (so clients can tell which level each enemy belongs to).
+function Network:buildStateMsg(players, enemies)
+    local parts = {"STATE", #players}
     for _, p in ipairs(players) do
         parts[#parts+1] = p.id
+        parts[#parts+1] = p.level or 1
         parts[#parts+1] = math.floor(p.x)
         parts[#parts+1] = math.floor(p.y)
         parts[#parts+1] = math.floor(p.vx)
@@ -144,6 +147,7 @@ function Network:buildStateMsg(players, enemies, currentLevel)
     end
     parts[#parts+1] = #enemies
     for _, e in ipairs(enemies) do
+        parts[#parts+1] = e.level or 1
         parts[#parts+1] = e.id or 0
         parts[#parts+1] = math.floor(e.x)
         parts[#parts+1] = math.floor(e.y)
@@ -187,7 +191,7 @@ function Network:clientUpdate(dt, inputs)
                 elseif d[1] == "LEVEL" then
                     events[#events+1] = {type="level", num=d[2]}
                 elseif d[1] == "COIN" then
-                    events[#events+1] = {type="coin", tx=d[2], ty=d[3]}
+                    events[#events+1] = {type="coin", tx=d[2], ty=d[3], level=d[4] or 1}
                 end
             end
         elseif ev.type == "disconnect" then
@@ -199,10 +203,33 @@ function Network:clientUpdate(dt, inputs)
 end
 
 -- Broadcast a coin tile removal to all clients (host only)
-function Network:broadcastCoinRemoval(tx, ty)
-    local msg = pack({"COIN", tx, ty})
+function Network:broadcastCoinRemoval(tx, ty, level)
+    local msg = pack({"COIN", tx, ty, level or 1})
     for peer, _ in pairs(self.peers) do
         peer:send(msg, 0, "reliable")
+    end
+end
+
+-- Send a coin tile removal to a single peer. Used to sync a just-loaded
+-- level's current state to a player who advanced into / joined it after
+-- other players had already collected coins there.
+function Network:sendCoinRemovalTo(playerId, tx, ty, level)
+    for peer, id in pairs(self.peers) do
+        if id == playerId then
+            peer:send(pack({"COIN", tx, ty, level or 1}), 0, "reliable")
+            return
+        end
+    end
+end
+
+-- Send a LEVEL change message to a single peer (used for mid-game joins
+-- so the new client knows which level the host is currently on).
+function Network:sendLevelTo(playerId, num)
+    for peer, id in pairs(self.peers) do
+        if id == playerId then
+            peer:send(pack({"LEVEL", num}), 0, "reliable")
+            return
+        end
     end
 end
 

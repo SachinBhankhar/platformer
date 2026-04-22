@@ -33,7 +33,6 @@ function World.new(levelData)
     self.skyTop     = levelData.skyTop     or {0.38, 0.6,  0.95}
     self.skyBot     = levelData.skyBot     or {0.55, 0.75, 1.0}
     self.groundColor= levelData.groundColor or {0.55, 0.35, 0.15}
-    tileColors[T_SOLID] = self.groundColor
     self.pendingRemovals = {}
     return self
 end
@@ -161,7 +160,7 @@ function World:draw(camX, camY, screenW, screenH)
         for c = c1, c2 do
             local tid = self.map[r][c]
             if tid ~= T_EMPTY then
-                local col = tileColors[tid] or {0.5, 0.5, 0.5}
+                local col = (tid == T_SOLID) and self.groundColor or tileColors[tid] or {0.5, 0.5, 0.5}
                 love.graphics.setColor(col)
                 local px = (c - 1) * T - camX
                 local py = (r - 1) * T - camY

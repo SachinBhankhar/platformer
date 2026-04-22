@@ -30,6 +30,8 @@ function Player.new(world, id)
     local self = setmetatable({}, Player)
     self.world  = world
     self.id     = id or 1
+    self.level  = 1
+    self.bannerTimer = 0  -- shows "Level N" overlay briefly after advancing
     self.color  = PLAYER_COLORS[((id or 1) - 1) % #PLAYER_COLORS + 1]
     self.x      = (1 + (id or 1)) * T
     self.y      = 9 * T
@@ -51,7 +53,9 @@ function Player.new(world, id)
     self.startY = self.y
     self.walkTimer = 0
     self.walkFrame = 0
-    self.invTimer  = 0
+    -- Spawn protection: shared-world levels may already have enemies patrolling
+    -- when a new player drops in, so give everyone a grace period.
+    self.invTimer  = 2.5
     -- input state (filled by local keyboard or network)
     self.input = {left=false, right=false, jump=false, run=false, jumpPressed=false}
     self._prevJump = false
@@ -324,7 +328,10 @@ function Player:resetForLevel(world)
     self.jumpBuffer  = 0
     self.walkFrame   = 0
     self.walkTimer   = 0
-    self.invTimer    = 0
+    -- Spawn protection: the level's enemies may have been patrolling for a
+    -- while before this player arrived, so without this they can spawn right
+    -- on top of one and die instantly.
+    self.invTimer    = 2.5
 end
 
 function Player:draw(camX, camY)

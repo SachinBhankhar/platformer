@@ -7,107 +7,106 @@ local Levels    = require "levels"
 local Network   = require "network"
 
 -- ── Game state ───────────────────────────────────────────────────────────────
--- States: "menu"  "lobby"  "playing"  "level_complete"  "game_over"
+-- States: "menu"  "lobby"  "playing"  "game_over"
 local state = "menu"
 
-local world, camera, particles
-local players  = {}
-local enemies  = {}
-local bgStars  = {}
-local totalCoins  = 0
-local currentLevel = 1
-local localPlayerId = 1  -- which player this machine controls
+-- Per-level cache of { world, enemies, stars }. Lazily populated; each player
+-- lives in their own level's world so they can race independently.
+local levelInstances = {}
 
-local net = nil          -- Network object (nil = solo, else host or client)
-local isHost = true      -- true for solo or host
+-- Current render view (= local player's level). These are aliases into
+-- levelInstances for whatever level the local player is currently on.
+local world, enemies, bgStars
+local camera, particles
+local players = {}
+local totalCoins   = 0
+local currentLevel = 1          -- local player's level (for rendering)
+local localPlayerId = 1
+
+local net = nil
+local isHost = true
 
 -- Lobby UI
-local lobbyInput   = ""     -- typed IP when joining
-local lobbyMode    = nil    -- "host" or "join"
-local lobbyMsg     = ""
-local levelTransTimer = 0
-local LEVEL_TRANS_DELAY = 2.5
+local lobbyInput = ""
+local lobbyMode  = nil
+local lobbyMsg   = ""
+local LEVEL_BANNER_TIME = 1.8
 
--- ── Helpers ──────────────────────────────────────────────────────────────────
+-- ── Level instance helpers ───────────────────────────────────────────────────
 
-local function makeStars()
-    bgStars = {}
+local function makeStarsFor(w)
+    local s = {}
     for _ = 1, 80 do
-        table.insert(bgStars, {
-            x = math.random(0, world.width  * world.tileSize),
-            y = math.random(0, world.height * world.tileSize),
+        table.insert(s, {
+            x = math.random(0, w.width  * w.tileSize),
+            y = math.random(0, w.height * w.tileSize),
             r = math.random() * 0.5 + 0.5,
         })
     end
+    return s
 end
 
-local function spawnEnemies(levelData)
-    enemies = {}
-    for idx, sp in ipairs(levelData.enemies or {}) do
-        local e = Enemy.new(world, sp[1], sp[2])
-        e.id = idx  -- stable id so the client can match after host removals
-        table.insert(enemies, e)
+local function getLevelInstance(lvl)
+    local inst = levelInstances[lvl]
+    if inst then return inst end
+    local data = Levels[lvl]
+    local w = World.new(data)
+    local es = {}
+    for idx, sp in ipairs(data.enemies or {}) do
+        local e = Enemy.new(w, sp[1], sp[2])
+        e.id    = idx
+        e.level = lvl
+        es[#es+1] = e
     end
+    inst = { world = w, enemies = es, stars = makeStarsFor(w) }
+    levelInstances[lvl] = inst
+    return inst
 end
 
-local function findEnemy(id)
-    for _, e in ipairs(enemies) do
-        if e.id == id then return e end
-    end
-end
-
-local function loadLevel(num)
-    currentLevel = num
-    local lvl = Levels[num]
-    world = World.new(lvl)
-    camera = Camera.new(world)
+local function setLocalView(lvl)
+    currentLevel = lvl
+    local inst = getLevelInstance(lvl)
+    world   = inst.world
+    enemies = inst.enemies
+    bgStars = inst.stars
+    camera  = Camera.new(world)
     totalCoins = world:countCoins()
-    spawnEnemies(lvl)
-    makeStars()
-    -- Reset all players for new level (keep lives & coins)
+end
+
+local function playersOnLevel(lvl)
+    local list = {}
     for _, p in ipairs(players) do
-        p:resetForLevel(world)
+        if p.level == lvl and not p.eliminated then
+            list[#list+1] = p
+        end
     end
+    return list
+end
+
+local function allEnemiesFlat()
+    local list = {}
+    for lvl, inst in pairs(levelInstances) do
+        for _, e in ipairs(inst.enemies) do
+            e.level = lvl
+            list[#list+1] = e
+        end
+    end
+    return list
+end
+
+-- Move a player onto a given level (creates instance, sets spawn, wires world).
+local function placePlayerOnLevel(p, lvl)
+    p.level = lvl
+    local inst = getLevelInstance(lvl)
+    p:resetForLevel(inst.world)
+    p.bannerTimer = LEVEL_BANNER_TIME
 end
 
 local function addPlayer(id)
     local p = Player.new(world, id)
+    p.level = 1
     players[id] = p
     return p
-end
-
-local function initSolo()
-    players = {}
-    world   = World.new(Levels[1])
-    camera  = Camera.new(world)
-    particles = Particles.new()
-    totalCoins = world:countCoins()
-    spawnEnemies(Levels[1])
-    makeStars()
-    currentLevel   = 1
-    localPlayerId  = 1
-    isHost         = true
-    net            = nil
-    local p = Player.new(world, 1)
-    players[1] = p
-end
-
-local function allPlayersWon()
-    local active = 0
-    for _, p in ipairs(players) do
-        if not p.eliminated then
-            active = active + 1
-            if not p.won then return false end
-        end
-    end
-    return active > 0
-end
-
-local function allPlayersEliminated()
-    for _, p in ipairs(players) do
-        if not p.eliminated then return false end
-    end
-    return #players > 0
 end
 
 local function activePlayers()
@@ -118,18 +117,75 @@ local function activePlayers()
     return list
 end
 
--- ── Network helpers ───────────────────────────────────────────────────────────
+local function allPlayersDone()
+    local any = false
+    for _, p in ipairs(players) do
+        any = true
+        if not p.eliminated and not p.won then return false end
+    end
+    return any
+end
+
+local function allPlayersEliminated()
+    for _, p in ipairs(players) do
+        if not p.eliminated then return false end
+    end
+    return #players > 0
+end
+
+local function resetLevelInstances()
+    levelInstances = {}
+end
+
+-- Send the current removed-coin tiles for `lvl` to a single peer so their
+-- fresh client-side world matches the shared server state (the other player
+-- may have been running around collecting there already).
+local function syncCoinsToPeer(peerId, lvl)
+    if not net or not isHost then return end
+    local inst = levelInstances[lvl]
+    if not inst then return end
+    local src = Levels[lvl] and Levels[lvl].map
+    if not src then return end
+    for r = 1, inst.world.height do
+        local srcRow = src[r]
+        local wrRow  = inst.world.map[r]
+        if srcRow and wrRow then
+            for c = 1, inst.world.width do
+                if srcRow[c] == World.T_COIN and wrRow[c] == World.T_EMPTY then
+                    net:sendCoinRemovalTo(peerId, c, r, lvl)
+                end
+            end
+        end
+    end
+end
+
+-- ── Initialization ───────────────────────────────────────────────────────────
+
+local function initSolo()
+    players = {}
+    resetLevelInstances()
+    particles = Particles.new()
+    localPlayerId = 1
+    isHost        = true
+    net           = nil
+    setLocalView(1)
+    local p = Player.new(world, 1)
+    p.level = 1
+    players[1] = p
+end
+
+-- ── Network helpers ──────────────────────────────────────────────────────────
 
 local function applyNetworkState(data)
-    -- data format: STATE | levelNum | playerCount | [id x y vx vy lives elim dead won facing ground walkFrame coins] x N | enemyCount | [ex ey dead deadTimer] x M
+    -- Format: STATE | playerCount
+    --   | [id level x y vx vy lives elim dead won facing ground walkFrame coins] xN
+    --   | enemyCount
+    --   | [level eid ex ey dead deadTimer] xM
     local i = 2
-    local lvl = data[i]; i = i + 1
-    if lvl ~= currentLevel then
-        loadLevel(lvl)
-    end
     local pcount = data[i]; i = i + 1
     for _ = 1, pcount do
         local id       = data[i];   i = i + 1
+        local lvl      = data[i];   i = i + 1
         local x        = data[i];   i = i + 1
         local y        = data[i];   i = i + 1
         local vx       = data[i];   i = i + 1
@@ -144,15 +200,25 @@ local function applyNetworkState(data)
         local coins    = data[i];   i = i + 1
         if not players[id] then
             players[id] = Player.new(world, id)
+            players[id].level = lvl
         end
         local p = players[id]
-        local wasDead = p.dead
+        local wasDead  = p.dead
+        local prevLevel = p.level
         p.lives = lives; p.dead = dead
         p.eliminated = elim; p.won = won; p.coins = coins
+        p.level = lvl
         if id == localPlayerId then
-            -- Client-side prediction with server reconciliation: trust local
-            -- prediction while it stays close to the host, snap when it drifts.
-            -- Always snap on death/respawn transitions (prediction can't know).
+            -- If the host advanced us to a new level, switch our view.
+            if lvl ~= currentLevel then
+                setLocalView(lvl)
+                p.world = world
+                p.bannerTimer = LEVEL_BANNER_TIME
+                -- Match the host-side spawn-protection window so the
+                -- blink/invuln feels consistent locally.
+                p.invTimer = 2.5
+            end
+            -- Client-side prediction with reconciliation.
             if dead and not wasDead then
                 p.x = x; p.y = y; p.vx = vx; p.vy = vy
                 p.respawnTimer = 1.5
@@ -166,26 +232,31 @@ local function applyNetworkState(data)
                 end
             end
         else
-            -- Remote players: full sync, host is authoritative.
             p.x = x; p.y = y; p.vx = vx; p.vy = vy
             p.facing = facing; p.onGround = onGround; p.walkFrame = walkFrame
         end
     end
     local ecount = data[i]; i = i + 1
-    -- Sync enemies by stable id. The host removes enemies after their death
-    -- animation, so any local enemy whose id isn't in the snapshot is gone.
+    -- Only enemies on the local player's level matter for our view. Track
+    -- which ids we saw so we can prune removed enemies from the local list.
     local seen = {}
     for _ = 1, ecount do
+        local elvl = data[i]; i = i + 1
         local eid  = data[i]; i = i + 1
         local ex   = data[i]; i = i + 1
         local ey   = data[i]; i = i + 1
-        local dead = data[i]==1; i = i + 1
-        local dt   = data[i]; i = i + 1
-        seen[eid] = true
-        local e = findEnemy(eid)
-        if e then
-            e.x = ex; e.y = ey
-            e.dead = dead; e.deadTimer = dt
+        local edead= data[i]==1; i = i + 1
+        local edt  = data[i]; i = i + 1
+        if elvl == currentLevel then
+            seen[eid] = true
+            local found
+            for _, e in ipairs(enemies) do
+                if e.id == eid then found = e; break end
+            end
+            if found then
+                found.x = ex; found.y = ey
+                found.dead = edead; found.deadTimer = edt
+            end
         end
     end
     local k = 1
@@ -194,64 +265,63 @@ local function applyNetworkState(data)
     end
 end
 
--- ── Love callbacks ────────────────────────────────────────────────────────────
+-- ── Love callbacks ───────────────────────────────────────────────────────────
 
 function love.load()
     love.graphics.setDefaultFilter("nearest", "nearest")
     math.randomseed(os.time())
     -- Minimal init so we can draw the menu immediately
-    world     = World.new(Levels[1])
-    camera    = Camera.new(world)
+    setLocalView(1)
     particles = Particles.new()
-    makeStars()
+end
+
+local function advancePlayerIfWon(p)
+    if not p.won then return end
+    if p.level >= #Levels then
+        -- Final level: stay won (finished).
+        return
+    end
+    -- Advance this player to next level individually.
+    local nextLvl = p.level + 1
+    placePlayerOnLevel(p, nextLvl)
+    p.won = false
+    if p.id == localPlayerId then
+        setLocalView(nextLvl)
+        p.world = world
+    end
+    if net and isHost and p.id ~= localPlayerId then
+        -- The remote peer is about to setLocalView(nextLvl) on their side
+        -- (driven by p.level in the next STATE snapshot). Their world there
+        -- will start fresh, so replay the coin-tile removals that already
+        -- happened on that level before they arrived.
+        syncCoinsToPeer(p.id, nextLvl)
+    end
 end
 
 function love.update(dt)
     dt = math.min(dt, 0.05)
 
-    if state == "menu" then return end
-
-    if state == "lobby" then
-        updateLobby(dt)
-        return
-    end
-
-    if state == "level_complete" then
-        levelTransTimer = levelTransTimer - dt
-        if levelTransTimer <= 0 then
-            if currentLevel < #Levels then
-                local nextLvl = currentLevel + 1
-                loadLevel(nextLvl)
-                if net and isHost then
-                    net:broadcastLevel(nextLvl)
-                end
-                state = "playing"
-            else
-                state = "game_over"
-            end
-        end
-        return
-    end
-
+    if state == "menu"     then return end
+    if state == "lobby"    then updateLobby(dt); return end
     if state == "game_over" then return end
 
     -- ── playing ──────────────────────────────────────────────────────────────
 
-    -- Network tick
     if net then
         if isHost then
             local lp = players[localPlayerId]
             if lp then lp:readLocalKeys() end
-            local evts = net:hostUpdate(dt, activePlayers(), world, enemies, currentLevel)
+            local evts = net:hostUpdate(dt, activePlayers(), world, allEnemiesFlat(), currentLevel)
             for _, ev in ipairs(evts) do
                 if ev.type == "join" then
-                    if not players[ev.id] then
-                        addPlayer(ev.id)
-                    end
+                    if not players[ev.id] then addPlayer(ev.id) end
+                    -- Mid-game join: the new peer is stuck in lobby waiting
+                    -- for a LEVEL signal, and needs the shared coin state for
+                    -- the level they're about to load.
+                    net:sendLevelTo(ev.id, 1)
+                    syncCoinsToPeer(ev.id, 1)
                 elseif ev.type == "leave" then
-                    if players[ev.id] then
-                        players[ev.id].eliminated = true
-                    end
+                    if players[ev.id] then players[ev.id].eliminated = true end
                 elseif ev.type == "input" then
                     local p = players[ev.id]
                     if p then
@@ -259,20 +329,14 @@ function love.update(dt)
                         p.input.right = ev.right
                         p.input.jump  = ev.jump
                         p.input.run   = ev.run
-                        -- Latch jumpPressed: multiple INPUT packets can arrive
-                        -- between sim ticks, and we must not let a later
-                        -- `false` packet erase a pending jump edge.
                         if ev.jumpPressed then p.input.jumpPressed = true end
                     end
                 end
             end
         else
-            -- Client: read local keys, let host know
             local lp = players[localPlayerId]
             if lp then lp:readLocalKeys() end
             local inp = lp and lp.input or {left=false,right=false,jump=false,run=false,jumpPressed=false}
-
-            -- Snapshot coins before applying host state
             local prevCoins = lp and lp.coins or 0
 
             local evts = net:clientUpdate(dt, inp)
@@ -280,107 +344,135 @@ function love.update(dt)
                 if ev.type == "state" then
                     applyNetworkState(ev.data)
                 elseif ev.type == "coin" then
-                    world:setTile(ev.tx, ev.ty, World.T_EMPTY)
+                    -- Apply coin removal to the matching level's world. The
+                    -- host fires sync COIN msgs for a newly-entered level
+                    -- *before* the STATE snapshot that flips p.level, so the
+                    -- client may not have the instance yet — create it now
+                    -- so the removal lands and persists for when we setLocalView.
+                    local inst = levelInstances[ev.level] or getLevelInstance(ev.level)
+                    inst.world:setTile(ev.tx, ev.ty, World.T_EMPTY)
                 elseif ev.type == "level" then
-                    loadLevel(ev.num)
+                    -- Host -> client lobby-to-playing signal. Start level 1.
+                    setLocalView(ev.num or 1)
                 elseif ev.type == "disconnect" then
                     lobbyMsg = "Disconnected from host"
                     state = "menu"
                 end
             end
 
-            -- Spawn coin particles when host confirms a collection
             if lp and lp.coins > prevCoins then
                 particles:spawn(lp.x + lp.w/2, lp.y, {1,0.9,0}, 8, 140)
             end
 
-            -- Client-side prediction: simulate local player's movement for
-            -- instant input response. applyNetworkState reconciles against
-            -- the host and snaps if drift exceeds threshold.
             if lp and not lp.eliminated and not lp.dead then
                 lp:updateMovement(dt)
             end
+            if lp and lp.bannerTimer > 0 then lp.bannerTimer = lp.bannerTimer - dt end
             particles:update(dt)
             local sw, sh = love.graphics.getDimensions()
             if lp then camera:follow({lp}, sw, sh) end
             return
         end
     else
-        -- Solo: read keys for player 1
         local lp = players[localPlayerId]
         if lp then lp:readLocalKeys() end
     end
 
-    -- Host / Solo: full simulation
-    local aList = activePlayers()
-
-    for _, p in ipairs(aList) do
-        if not p.eliminated then
+    -- Host / Solo: full simulation.
+    -- Each player simulates against their own level's world. checkGoal +
+    -- coin collection happen inside Player:update using p.world.
+    for _, p in ipairs(players) do
+        if p and not p.eliminated then
+            -- Make sure p.world matches p.level (in case it was just set).
+            local inst = getLevelInstance(p.level)
+            p.world = inst.world
             local prevCoins = p.coins
             p:update(dt)
             if p.coins > prevCoins then
                 particles:spawn(p.x + p.w/2, p.y, {1,0.9,0}, 8, 140)
             end
+            if p.bannerTimer > 0 then p.bannerTimer = p.bannerTimer - dt end
         end
     end
 
-    -- Broadcast coin removals to clients
-    if net and isHost and #world.pendingRemovals > 0 then
-        for _, pos in ipairs(world.pendingRemovals) do
-            net:broadcastCoinRemoval(pos[1], pos[2])
-        end
-        world.pendingRemovals = {}
+    -- Advance any players who hit the goal (per-player, independent).
+    for _, p in ipairs(players) do
+        if p and not p.eliminated then advancePlayerIfWon(p) end
     end
 
-    -- PvP stomp checks
-    for _, attacker in ipairs(aList) do
-        for _, victim in ipairs(aList) do
-            if attacker ~= victim then
-                local wasEliminated = victim.eliminated
-                victim:checkStompedBy(attacker)
-                if victim.eliminated and not wasEliminated then
-                    particles:spawn(victim.x + victim.w/2, victim.y, {1,0.3,0.3}, 12, 160)
+    -- Broadcast coin removals per level.
+    if net and isHost then
+        for lvl, inst in pairs(levelInstances) do
+            if #inst.world.pendingRemovals > 0 then
+                for _, pos in ipairs(inst.world.pendingRemovals) do
+                    net:broadcastCoinRemoval(pos[1], pos[2], lvl)
+                end
+                inst.world.pendingRemovals = {}
+            end
+        end
+    else
+        -- Solo: clear pendingRemovals so they don't accumulate forever.
+        for _, inst in pairs(levelInstances) do
+            inst.world.pendingRemovals = {}
+        end
+    end
+
+    -- PvP stomp checks: only within the same level.
+    for lvl, _ in pairs(levelInstances) do
+        local group = playersOnLevel(lvl)
+        for _, attacker in ipairs(group) do
+            for _, victim in ipairs(group) do
+                if attacker ~= victim then
+                    local wasEliminated = victim.eliminated
+                    victim:checkStompedBy(attacker)
+                    if victim.eliminated and not wasEliminated then
+                        particles:spawn(victim.x + victim.w/2, victim.y, {1,0.3,0.3}, 12, 160)
+                    end
                 end
             end
         end
     end
 
-    -- Enemies
-    local i = 1
-    while i <= #enemies do
-        local alive = enemies[i]:update(dt, aList)
-        if not alive then
-            particles:spawn(enemies[i].x + 12, enemies[i].y + 12, {0.6,0.3,0}, 10, 100)
-            table.remove(enemies, i)
-        else
-            i = i + 1
+    -- Enemy updates: each level's enemies see only players on that level.
+    for lvl, inst in pairs(levelInstances) do
+        local group = playersOnLevel(lvl)
+        local i = 1
+        while i <= #inst.enemies do
+            local e = inst.enemies[i]
+            e.level = lvl
+            local alive = e:update(dt, group)
+            if not alive then
+                particles:spawn(e.x + 12, e.y + 12, {0.6,0.3,0}, 10, 100)
+                table.remove(inst.enemies, i)
+            else
+                i = i + 1
+            end
         end
     end
 
     particles:update(dt)
 
+    -- Camera: follow local player (or all players in solo).
     local sw, sh = love.graphics.getDimensions()
-    local followList
     if net then
-        -- Multiplayer: always follow only the local player
         local lp = players[localPlayerId]
-        followList = lp and {lp} or {}
+        if lp then camera:follow({lp}, sw, sh) end
     else
-        followList = aList
-    end
-    if #followList > 0 then
-        camera:follow(followList, sw, sh)
+        local lp = players[localPlayerId]
+        if lp then camera:follow({lp}, sw, sh) end
     end
 
-    -- State transitions
-    if allPlayersWon() then
-        if currentLevel < #Levels then
-            state = "level_complete"
-            levelTransTimer = LEVEL_TRANS_DELAY
-        else
-            state = "game_over"
-        end
-    elseif allPlayersEliminated() then
+    -- Sync local view to local player's level (in case it changed).
+    local lp = players[localPlayerId]
+    if lp and lp.level ~= currentLevel then
+        setLocalView(lp.level)
+        lp.world = world
+    end
+
+    -- Global end conditions.
+    if allPlayersEliminated() then
+        state = "game_over"
+    elseif allPlayersDone() then
         state = "game_over"
     end
 end
@@ -403,8 +495,7 @@ function updateLobby(dt)
                 addPlayer(ev.id)
                 lobbyMsg = "Connected! You are Player " .. ev.id .. ". Waiting for host..."
             elseif ev.type == "level" then
-                -- Host started the game
-                loadLevel(ev.num)
+                setLocalView(ev.num or 1)
                 state = "playing"
             end
         end
@@ -414,27 +505,18 @@ end
 function love.draw()
     local sw, sh = love.graphics.getDimensions()
 
-    if state == "menu" then
-        drawMenu(sw, sh)
-        return
-    end
-
-    if state == "lobby" then
-        drawLobby(sw, sh)
-        return
-    end
+    if state == "menu"  then drawMenu(sw, sh);  return end
+    if state == "lobby" then drawLobby(sw, sh); return end
 
     local cx, cy = camera.x, camera.y
     local sky = world.skyTop or {0.38, 0.6, 0.95}
     local skyb= world.skyBot or {0.55, 0.75, 1.0}
 
-    -- Sky
     love.graphics.setColor(sky)
     love.graphics.rectangle("fill", 0, 0, sw, sh * 0.6)
     love.graphics.setColor(skyb)
     love.graphics.rectangle("fill", 0, sh * 0.6, sw, sh * 0.4)
 
-    -- Stars
     love.graphics.setColor(1, 1, 1, 0.7)
     for _, s in ipairs(bgStars) do
         local sx = (s.x - cx * 0.1) % sw
@@ -445,19 +527,23 @@ function love.draw()
     world:draw(cx, cy, sw, sh)
     for _, e in ipairs(enemies) do e:draw(cx, cy) end
     particles:draw(cx, cy)
+    -- Only render players on our level.
     for _, p in ipairs(players) do
-        if p then p:draw(cx, cy) end
+        if p and p.level == currentLevel then p:draw(cx, cy) end
     end
 
     drawHUD(sw, sh)
 
-    if state == "level_complete" then
-        love.graphics.setColor(0, 0, 0, 0.6)
-        love.graphics.rectangle("fill", sw/2-180, sh/2-50, 360, 90, 12, 12)
-        love.graphics.setColor(1, 0.9, 0.1)
-        love.graphics.printf("LEVEL CLEAR!", 0, sh/2 - 36, sw, "center")
-        love.graphics.setColor(1, 1, 1)
-        love.graphics.printf("Next: " .. (Levels[currentLevel+1] and Levels[currentLevel+1].name or "???"), 0, sh/2, sw, "center")
+    -- Per-player "Level N" banner on local player.
+    local lp = players[localPlayerId]
+    if lp and lp.bannerTimer and lp.bannerTimer > 0 then
+        local alpha = math.min(1, lp.bannerTimer / 0.4)
+        love.graphics.setColor(0, 0, 0, 0.5 * alpha)
+        love.graphics.rectangle("fill", sw/2 - 180, sh/2 - 40, 360, 70, 12, 12)
+        love.graphics.setColor(1, 0.9, 0.1, alpha)
+        love.graphics.printf("LEVEL " .. lp.level, 0, sh/2 - 30, sw, "center")
+        love.graphics.setColor(1, 1, 1, alpha)
+        love.graphics.printf(Levels[lp.level] and Levels[lp.level].name or "", 0, sh/2 - 5, sw, "center")
     end
 
     if state == "game_over" then
@@ -468,25 +554,28 @@ function love.draw()
             love.graphics.printf("GAME OVER", 0, sh/2 - 60, sw, "center")
         else
             love.graphics.setColor(0.3, 1, 0.4)
-            love.graphics.printf("YOU WIN!", 0, sh/2 - 60, sw, "center")
+            love.graphics.printf("RACE COMPLETE!", 0, sh/2 - 60, sw, "center")
         end
-        -- Show scores
         local yy = sh/2 - 20
         for _, p in ipairs(players) do
             if p then
                 love.graphics.setColor(p.color)
-                love.graphics.printf("P" .. p.id .. ": " .. p.coins .. " coins", 0, yy, sw, "center")
+                love.graphics.printf("P" .. p.id .. ": L" .. p.level .. "  " .. p.coins .. " coins",
+                    0, yy, sw, "center")
                 yy = yy + 20
             end
         end
         love.graphics.setColor(1, 1, 1)
-        love.graphics.printf("Press R to play again  |  ESC for menu", 0, sh/2 + 50, sw, "center")
+        if net then
+            love.graphics.printf("ESC for menu", 0, sh/2 + 50, sw, "center")
+        else
+            love.graphics.printf("Press R to play again  |  ESC for menu", 0, sh/2 + 50, sw, "center")
+        end
     end
 end
 
 local function drawHeart(x, y, size, r, g, b, a)
     love.graphics.setColor(r, g, b, a or 1)
-    -- Two circles + triangle approximation of a heart
     local s = size * 0.5
     love.graphics.circle("fill", x - s*0.5, y, s * 0.65)
     love.graphics.circle("fill", x + s*0.5, y, s * 0.65)
@@ -497,38 +586,34 @@ local function drawHeart(x, y, size, r, g, b, a)
 end
 
 function drawHUD(sw, sh)
-    -- Level name bar
     local font   = love.graphics.getFont()
-    local lvlTxt = "World " .. math.ceil(currentLevel/4) .. "-" .. ((currentLevel-1)%4+1) .. ": " .. Levels[currentLevel].name
+    local lp     = players[localPlayerId]
+    local hudLvl = (lp and lp.level) or currentLevel
+    local lvlTxt = "World " .. math.ceil(hudLvl/4) .. "-" .. ((hudLvl-1)%4+1) .. ": " .. Levels[hudLvl].name
     local barW   = font:getWidth(lvlTxt) + 20
     love.graphics.setColor(0, 0, 0, 0.55)
     love.graphics.rectangle("fill", 6, 6, barW, 22, 5, 5)
     love.graphics.setColor(1, 1, 0.5)
     love.graphics.print(lvlTxt, 16, 10)
 
-    -- Per-player cards
-    local cardW, cardH = 170, 36
+    local cardW, cardH = 190, 36
     local yy = 36
     for _, p in ipairs(players) do
         if p then
-            -- Card background
             love.graphics.setColor(0, 0, 0, 0.55)
             love.graphics.rectangle("fill", 6, yy, cardW, cardH, 5, 5)
 
-            -- Player color stripe on left
             love.graphics.setColor(p.color[1], p.color[2], p.color[3])
             love.graphics.rectangle("fill", 6, yy, 5, cardH, 5, 0)
 
-            -- Player label
-            local label = "P" .. p.id
+            local label = "P" .. p.id .. "  L" .. (p.level or 1)
             if     p.eliminated then label = label .. " OUT"
             elseif p.won        then label = label .. " WIN"
-            elseif p.dead       then label = label .. " ×"
+            elseif p.dead       then label = label .. " x"
             end
             love.graphics.setColor(1, 1, 1)
             love.graphics.print(label, 16, yy + 4)
 
-            -- Hearts (lives)
             local maxLives = 3
             local hx = 16
             local hy = yy + cardH - 14
@@ -542,7 +627,6 @@ function drawHUD(sw, sh)
                 hx = hx + 14
             end
 
-            -- Coin icon + count
             love.graphics.setColor(1, 0.85, 0)
             love.graphics.circle("fill", cardW - 22, yy + cardH/2, 6)
             love.graphics.setColor(0.8, 0.6, 0)
@@ -576,7 +660,6 @@ function drawLobby(sw, sh)
         love.graphics.setColor(1, 0.9, 0.1)
         love.graphics.printf("HOSTING", 0, sh/2 - 110, sw, "center")
         love.graphics.setColor(1, 1, 1)
-        -- Show local IP hint
         local ip = getLocalIP()
         love.graphics.printf("Your IP: " .. ip, 0, sh/2 - 70, sw, "center")
         love.graphics.printf("Port: 6789", 0, sh/2 - 45, sw, "center")
@@ -590,7 +673,6 @@ function drawLobby(sw, sh)
         love.graphics.printf("JOIN GAME", 0, sh/2 - 110, sw, "center")
         love.graphics.setColor(1, 1, 1)
         love.graphics.printf("Enter host IP address:", 0, sh/2 - 50, sw, "center")
-        -- Input box
         love.graphics.setColor(0.2, 0.2, 0.3)
         love.graphics.rectangle("fill", sw/2 - 120, sh/2 - 10, 240, 30, 6, 6)
         love.graphics.setColor(1, 1, 1)
@@ -603,7 +685,6 @@ function drawLobby(sw, sh)
 end
 
 function getLocalIP()
-    -- LÖVE doesn't have a direct IP API; best effort via UDP
     local ok, socket = pcall(require, "socket")
     if ok then
         local s = socket.udp()
@@ -634,17 +715,14 @@ function love.keypressed(key)
             initSolo()
             state = "playing"
         elseif key == "h" then
-            -- Host
             players = {}
-            world   = World.new(Levels[1])
-            camera  = Camera.new(world)
+            resetLevelInstances()
             particles = Particles.new()
-            spawnEnemies(Levels[1])
-            makeStars()
-            currentLevel  = 1
+            setLocalView(1)
             localPlayerId = 1
             isHost        = true
-            players[1]    = Player.new(world, 1)
+            local p = Player.new(world, 1); p.level = 1
+            players[1]    = p
             net           = Network.newHost()
             lobbyMode     = "host"
             lobbyMsg      = "Waiting for players..."
@@ -661,24 +739,19 @@ function love.keypressed(key)
     if state == "lobby" then
         if lobbyMode == "host" then
             if key == "return" then
-                -- Start the game, tell clients
                 if net then net:broadcastLevel(currentLevel) end
                 state = "playing"
             end
         else
-            -- join mode: handle IP input
             if key == "return" then
                 local ip = lobbyInput == "" and "127.0.0.1" or lobbyInput
                 players    = {}
-                world      = World.new(Levels[1])
-                camera     = Camera.new(world)
+                resetLevelInstances()
                 particles  = Particles.new()
-                spawnEnemies(Levels[1])
-                makeStars()
-                currentLevel  = 1
-                isHost        = false
-                net           = Network.newClient(ip)
-                lobbyMsg      = "Connecting to " .. ip .. "..."
+                setLocalView(1)
+                isHost     = false
+                net        = Network.newClient(ip)
+                lobbyMsg   = "Connecting to " .. ip .. "..."
             elseif key == "backspace" then
                 lobbyInput = lobbyInput:sub(1, -2)
             end
@@ -687,8 +760,7 @@ function love.keypressed(key)
     end
 
     if state == "game_over" then
-        if key == "r" then
-            if net then net:destroy(); net = nil end
+        if key == "r" and not net then
             initSolo()
             state = "playing"
         end
@@ -696,8 +768,9 @@ function love.keypressed(key)
     end
 
     if state == "playing" then
-        if key == "r" then
-            if net then net:destroy(); net = nil end
+        -- R restarts only in solo. In multiplayer it's a no-op so a stray
+        -- keypress can't tear down the live network session.
+        if key == "r" and not net then
             initSolo()
             state = "playing"
         end
@@ -706,7 +779,6 @@ end
 
 function love.textinput(t)
     if state == "lobby" and lobbyMode == "join" then
-        -- Only allow IP characters
         if t:match("[%d%.]") then
             lobbyInput = lobbyInput .. t
         end
